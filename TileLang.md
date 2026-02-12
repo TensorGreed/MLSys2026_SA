@@ -346,3 +346,80 @@ T.copy(acc_s, acc_s_cast)
 ```
 
 This makes probabilities fp16 to use TensorCores efficiently in the next GEMM.
+
+## Rescale output accumulator when max changes
+```python
+for i, j in T.Parallel(G, BV):
+    acc_o[i, j] *= scores_scale[i]
+```
+Because earlier acc_o contained sums weighted by exp2(...) under the previous max.
+
+So it needs the same rescale factor as logsum.
+
+## Load V for this block + V GEMM
+```python
+T.copy(V[i_b, i_s : i_s + BS, i_h, i_v * BV : (i_v + 1) * BV], V_shared)
+T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+```
+- V_shared: [BS, BV] (only the BV slice for this i_v tile)
+- acc_s_cast: [G, BS] probabilities
+- result: [G, BV] and accumulated into acc_o
+
+This is the core: ```O += P @ V```.
+
+## Final normalization (divide by denominator)
+```python
+for i, j in T.Parallel(G, BV):
+    acc_o[i, j] /= logsum[i]
+```
+
+After looping all selected blocks, acc_o is the numerator, logsum is the denominator.
+
+## Store output tile
+```python
+T.copy(acc_o, O_shared)
+T.copy(O_shared, Output[i_b, i_t, i_h * G : (i_h + 1) * G, i_v * BV : (i_v + 1) * BV])
+```
+
+Writes [G, BV] into Output at:
+
+- batch i_b
+- token i_t
+- heads i_h*G : (i_h+1)*G
+- dim slice i_v*BV : (i_v+1)*BV
+
+## The test harness (main())
+### Compile kernel with constants
+```python
+kernel = native_sparse_attention(...)
+print(kernel.get_kernel_source())
+```
+
+This compiles and prints generated CUDA (great for debugging).
+
+### Create random Q/K/V
+```python
+Q: (B, SEQ_LEN, HQ, D)
+K,V: (B, SEQ_LEN, H, D)
+```
+
+That matches the grouped attention design: many Q heads, fewer KV heads.
+
+### Build sparse indices
+```python
+block_indices = torch.full((B, SEQ_LEN, H, S), SEQ_LEN, ...)
+...
+i_i = torch.randperm(max(1, (t // block_size)))[:S]
+block_indices[b, t, h, :len(i_i)] = i_i
+```
+
+For each token t:
+- it chooses random previous blocks from [0 .. (t//block_size)-1]
+- stores those block ids in block_indices
+
+Then sorts.
+
+Finally:
+```python
+out = kernel(Q, K, V, block_indices.to(torch.int32))
+```
