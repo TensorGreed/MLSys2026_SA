@@ -45,6 +45,28 @@ else:
 ```
 
 Attention uses softmax( (QK^T) * (1/sqrt(dim)) ).
+
 This kernel uses exp2(x) (base-2 exponent) instead of exp(x) (base-e), so it multiplies by log2(e) ≈ 1.44269504 to convert:
+
 - ```exp(x) == exp2(x * log2(e))```
+
 So scale is pre-adjusted for exp2.
+
+## Grouped-query attention shapes
+```python
+head_kv = heads // groups
+q_shape = [batch, seq_len, heads, dim]
+kv_shape = [batch, seq_len, head_kv, dim]
+```
+This is **GQA / grouped-query attention**:
+- Q has ```heads```
+- K/V have fewer heads: ```head_kv = heads / groups```
+
+Each KV head is shared by ```groups``` query heads.
+
+Example from your test:
+
+- ```HQ = 16```, ```H = 1```, ```groups = HQ // H = 16```
+- ```head_kv = heads // groups = 16 // 16 = 1```
+
+So: 16 Q heads share 1 KV head.
