@@ -101,4 +101,67 @@ block_T = min(128, tilelang.math.next_power_of_2(dim))
 - It rounds dim up to a power of 2, but caps at 128.
 
 So if dim=32, block_T=32.
+
 If dim=96, next_pow2=128, so block_T=128.
+
+## Splitting dim into tiles
+```python
+NK = tilelang.cdiv(dim, block_T)
+NV = tilelang.cdiv(dim, block_T)
+assert NK == 1, "The key dimension can not be larger than 256"
+````
+
+- ```cdiv(a,b)``` = ceil(a/b)
+- If ```dim <= block_T```, NK = 1
+- This kernel currently only supports ```NK == 1``` (i.e. dim fits in one tile).
+
+NV is used later as the grid dimension for V/output tiling.
+
+Concept: the kernel produces output in **chunks of the hidden dimension**, so multiple CTAs cover different ```i_v``` tiles.
+
+## Rename constants for readability
+```python
+S = selected_blocks
+G = groups
+BS = block_S
+BK = BV = block_T
+num_stages = 2
+threads = 32
+```
+- S: number of selected blocks per query token.
+- G: groups (how many query heads share one KV head).
+- BS: block size in tokens.
+- BK: tile size in channels for Q/K.
+- BV: tile size in channels for V/O.
+
+```threads=32```: one warp per CTA (simple design).
+```num_stages=2```: pipeline depth for memory/compute overlap (double buffering).
+
+## The real GPU kernel (TileLang prim_func)
+```python
+@T.prim_func
+def native_sparse_attention(
+    Q: T.Tensor(q_shape, dtype),
+    K: T.Tensor(kv_shape, dtype),
+    V: T.Tensor(kv_shape, dtype),
+    BlockIndices: T.Tensor(block_indices_shape, block_indices_dtype),
+    Output: T.Tensor(q_shape, dtype),
+):
+```
+This defines the kernel signature. TileLang compiles this into CUDA.
+
+## Launch geometry (grid mapping)
+```python
+with T.Kernel(seq_len, NV, batch * head_kv, threads=threads) as (bx, by, bz):
+```
+This is the most important mapping:
+
+Grid dimensions:
+
+- bx in [0..seq_len-1] → query token index t
+- by in [0..NV-1] → which output-V tile of the hidden dim
+- bz in [0..batch*head_kv-1] → batch and KV head combined
+
+So one CTA computes:
+
+> output for (batch b, kv-head h) at token t, for one V tile i_v.
