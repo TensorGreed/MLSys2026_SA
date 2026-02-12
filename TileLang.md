@@ -1,6 +1,6 @@
 At a high level, for each query token t, instead of attending to all past keys 0..t, it attends only to a small list of selected key blocks (like DeepSeek/NSA style): selected_blocks = S.
 
-Imports
+## Imports
 ```python
 import torch
 import tilelang
@@ -16,7 +16,7 @@ from typing import Optional
 
 You also import einops but don’t use it in this snippet (can remove).
 
-The JIT wrapper
+## The JIT wrapper
 ```python
 @tilelang.jit(
     out_idx=[-1],
@@ -35,3 +35,16 @@ It’s a kernel generator: you pass compile-time constants like batch, seq_len, 
 - pass_configs: compiler knobs
   - FAST_MATH: use faster approximate math (like exp approximations).
   - disables some advanced lowering/scheduling passes (TMA, warp-specialized) for simplicity or compatibility.
+
+## Scaling factor (softmax math)
+```python
+if scale is None:
+    scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
+else:
+    scale = scale * 1.44269504  # log2(e)
+```
+
+Attention uses softmax( (QK^T) * (1/sqrt(dim)) ).
+This kernel uses exp2(x) (base-2 exponent) instead of exp(x) (base-e), so it multiplies by log2(e) ≈ 1.44269504 to convert:
+- ```exp(x) == exp2(x * log2(e))```
+So scale is pre-adjusted for exp2.
