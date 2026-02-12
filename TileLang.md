@@ -70,3 +70,35 @@ Example from your test:
 - ```head_kv = heads // groups = 16 // 16 = 1```
 
 So: 16 Q heads share 1 KV head.
+
+## Sparse pattern input
+```python
+block_indices_shape = [batch, seq_len, head_kv, selected_blocks]
+block_indices_dtype = T.int32
+```
+
+```BlockIndices[b, t, h, i]``` tells the kernel: for query token t, KV head h, attend to the i-th selected block (block id, not token id).
+
+Important concept:
+
+- ```BlockIndices``` stores **block indices** (0,1,2,...) — later multiplied by ```block_size``` to get token offset.
+
+## Dtypes and tiling sizes
+```python
+dtype = T.float16
+accum_dtype = T.float32
+block_S = block_size
+block_T = min(128, tilelang.math.next_power_of_2(dim))
+```
+
+- Q/K/V stored in FP16.
+- Accumulators in FP32 for stability.
+
+```block_S``` = number of tokens per sparse block (e.g., 64 or 32).
+
+```block_T``` = how many channels (the dim) to process per tile.
+
+- It rounds dim up to a power of 2, but caps at 128.
+
+So if dim=32, block_T=32.
+If dim=96, next_pow2=128, so block_T=128.
