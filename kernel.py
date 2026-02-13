@@ -1,110 +1,351 @@
 # ruff: noqa
-import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
-# These two often matter for CUTLASS/CUTE code paths:
-os.environ["CUDAARCHS"] = "80"
-os.environ["TVM_CUDA_ARCH"] = "sm_80"   # if TVM honors it in this build
+# ==================================================================================================
+# FULLY COMMENTED (BEGINNER-FRIENDLY) DEMO
+# ==================================================================================================
+#
+# Goal of this script
+# -------------------
+# You are building a *block-sparse attention* demo (DeepSeek-like idea):
+#
+#   Instead of attending to ALL past tokens (dense attention),
+#   we pick only a few "important" blocks of tokens (Top-K blocks),
+#   and do attention only on those blocks.
+#
+# This is usually much faster for long sequences because:
+#   - Dense attention cost per token grows with sequence length (O(T))
+#   - Block sparse attention cost grows with selected blocks (O(S * block_size))
+#
+# Two big parts:
+#   (A) INDEXER (Python / PyTorch):
+#         Uses content (Q and K) to decide which blocks matter.
+#         Produces BlockIndices[b, t, kv_head, s] = block_id.
+#
+#   (B) KERNEL (TileLang / CUDA):
+#         Uses BlockIndices to run attention only on those blocks.
+#
+# IMPORTANT conventions in this code:
+#   - Q shape: [B, T, HQ, D]        (HQ = number of query heads)
+#   - K shape: [B, T, H,  D]        (H  = number of key/value heads, "KV heads")
+#   - V shape: [B, T, H,  D]
+#   - groups = HQ // H              (Group Query Attention / GQA)
+#   - BlockIndices shape: [B, T, H, S]
+#       values are BLOCK IDs (0..num_blocks-1), NOT token indices
+#
+# Kernel detail:
+#   The kernel converts block_id -> token start offset by:
+#       i_s = block_id * block_size
+#
+# You ran this successfully on A100 (SM80).
+# ==================================================================================================
 
 import torch
 import tilelang
 from tilelang import language as T
 import tilelang.testing
 
-# ------------------------------------------------------------
-# Seeding: tilelang.testing.set_random_seed sets Python, NumPy,
-# Torch CPU, and Torch CUDA seeds (if CUDA is available).
-# NOTE: if you previously hit a device-side assert, the CUDA
-# context can be "poisoned" and even seeding can error.
-# In that case: restart the notebook kernel/runtime.
-# ------------------------------------------------------------
+
+# ==================================================================================================
+# 1) CONTENT-BASED TOP-K BLOCK INDEXER  (Option 2)
+# ==================================================================================================
+#
+# What problem does this solve?
+# -----------------------------
+# The kernel is fast *if you tell it which blocks to attend to*.
+# But "which blocks matter?" depends on the content of Q and K.
+#
+# A "DeepSeek-like" idea is:
+#   - Create a small "summary key" for each block (one vector per block)
+#   - For each token, compare its query to each block summary
+#   - Pick top-K blocks by similarity score
+#
+# This gives you a sparse pattern that is *content-driven* rather than random.
+#
+# Output:
+#   BlockIndices[b, t, kv_head, s]  =  block_id
+# where block_id is an integer in [0..num_blocks-1].
+#
+# Causality:
+#   For token t, we only allow blocks whose start <= t (causal attention).
+#
+# add_local:
+#   Many real sparse attention systems mix:
+#       - "local blocks" (most recent blocks)
+#       - "retrieved blocks" (content-chosen)
+#   add_local=2 forces last 2 blocks to always be included (when they exist).
+# ==================================================================================================
+
+@torch.no_grad()
+def build_block_indices_topk(
+    Q: torch.Tensor,         # [B, T, HQ, D]
+    K: torch.Tensor,         # [B, T, H,  D]
+    block_size: int,
+    selected_blocks: int,
+    groups: int,
+    summary: str = "mean",   # "mean" | "last" | "first"
+    add_local: int = 2,      # always include most recent N blocks
+) -> torch.Tensor:
+    """
+    Returns:
+        block_indices: int32 tensor of shape [B, T, H, S]
+            Each entry is a BLOCK ID (0..num_blocks-1).
+    """
+    # ---- Basic validation ----
+    assert Q.is_cuda and K.is_cuda, "This demo expects CUDA tensors"
+    B, T, HQ, D = Q.shape
+    Bk, Tk, H, Dk = K.shape
+    assert (B, T, D) == (Bk, Tk, Dk), "Q and K must match in B,T,D"
+    assert HQ % groups == 0, "HQ must be divisible by groups (GQA requirement)"
+
+    # In GQA, H (KV heads) = HQ / groups
+    head_kv = HQ // groups
+    assert head_kv == H, f"Expected H={H} == HQ/groups={head_kv}"
+
+    BS = int(block_size)
+    S = int(selected_blocks)
+
+    # How many blocks are in the sequence?
+    # Example: T=512, BS=32 => num_blocks = 16
+    num_blocks = (T + BS - 1) // BS
+
+    device = Q.device
+
+    # ----------------------------------------------------------------------------------------------
+    # Step A: Build block summaries of K
+    # ----------------------------------------------------------------------------------------------
+    # We want: Ksum[b, block_id, kv_head, d]
+    #
+    # How:
+    #   1) Pad K so its length is divisible by block_size
+    #   2) Reshape into blocks: [B, num_blocks, BS, H, D]
+    #   3) Reduce BS dimension to get one vector per block
+    # ----------------------------------------------------------------------------------------------
+
+    pad = num_blocks * BS - T
+    if pad:
+        # Pad with zeros; those padded tokens should never be used because causal mask prevents it
+        Kp = torch.cat(
+            [K, torch.zeros((B, pad, H, D), device=device, dtype=K.dtype)],
+            dim=1,
+        )
+    else:
+        Kp = K
+
+    # Now reshape into blocks
+    # Kb: [B, num_blocks, BS, H, D]
+    Kb = Kp.view(B, num_blocks, BS, H, D)
+
+    # Choose how to summarize block into one vector
+    if summary == "mean":
+        # Mean key vector for the block
+        Ksum = Kb.mean(dim=2)              # [B, num_blocks, H, D]
+    elif summary == "last":
+        # Only take the last token's key in each block
+        Ksum = Kb[:, :, BS - 1, :, :]      # [B, num_blocks, H, D]
+    elif summary == "first":
+        # Only take the first token's key in each block
+        Ksum = Kb[:, :, 0, :, :]           # [B, num_blocks, H, D]
+    else:
+        raise ValueError(f"summary must be one of mean/last/first, got {summary}")
+
+    # ----------------------------------------------------------------------------------------------
+    # Step B: Pick a representative Q head per KV head (GQA mapping)
+    # ----------------------------------------------------------------------------------------------
+    # Q has HQ heads, but K/V have only H heads.
+    # groups = HQ/H tells how many query heads share one KV head.
+    #
+    # Example: HQ=16, H=1, groups=16:
+    #   All 16 Q heads share the same K/V head.
+    #
+    # Here we pick the FIRST q-head in each group as representative for scoring.
+    # rep_qh[h] = h*groups
+    #
+    # Qrep: [B, T, H, D]
+    # ----------------------------------------------------------------------------------------------
+
+    rep_qh = torch.arange(H, device=device) * groups  # [H]
+    Qrep = Q[:, :, rep_qh, :]                         # [B, T, H, D]
+
+    # ----------------------------------------------------------------------------------------------
+    # Step C: Compute relevance score: dot(Qrep, Ksum)
+    # ----------------------------------------------------------------------------------------------
+    # scores[b, t, h, block] = dot( Qrep[b,t,h,:], Ksum[b,block,h,:] )
+    #
+    # This is a cheap approximate "which blocks seem relevant?"
+    # It's NOT the full attention score (which is token-by-token).
+    # It's a retrieval step (coarse).
+    #
+    # Shape: [B, T, H, num_blocks]
+    # ----------------------------------------------------------------------------------------------
+
+    scores = torch.einsum("bthd,bnhd->bthn", Qrep.float(), Ksum.float())
+
+    # ----------------------------------------------------------------------------------------------
+    # Step D: Apply causal mask
+    # ----------------------------------------------------------------------------------------------
+    # For token t, allowed blocks are those whose start token <= t.
+    # start token = block_id * BS
+    # equivalent condition: block_id <= t//BS
+    #
+    # We'll mask scores for block_id > t_blk to -inf so they never get selected.
+    # ----------------------------------------------------------------------------------------------
+
+    t_blk = (torch.arange(T, device=device) // BS).view(1, T, 1, 1)              # [1,T,1,1]
+    blk_ids = torch.arange(num_blocks, device=device).view(1, 1, 1, num_blocks)  # [1,1,1,num_blocks]
+    scores = scores.masked_fill(blk_ids > t_blk, float("-inf"))
+
+    # ----------------------------------------------------------------------------------------------
+    # Step E: Force include last add_local blocks (local attention)
+    # ----------------------------------------------------------------------------------------------
+    # This is common in real systems:
+    #   Always include recent blocks even if Top-K doesn't pick them.
+    #
+    # We "boost" their score by a huge constant so they appear in topk.
+    # ----------------------------------------------------------------------------------------------
+
+    if add_local and add_local > 0:
+        for j in range(add_local):
+            local_id = t_blk - j  # most recent block is t_blk, then t_blk-1, etc.
+            valid = (local_id >= 0)
+            idx = local_id.clamp(min=0).expand(B, T, H, 1)   # shape [B,T,H,1]
+            boost = valid.expand(B, T, H, 1).float() * 1e9    # big boost
+            scores.scatter_add_(dim=-1, index=idx, src=boost)
+
+    # ----------------------------------------------------------------------------------------------
+    # Step F: Top-K selection
+    # ----------------------------------------------------------------------------------------------
+    # For each (b,t,h), choose K block IDs with highest scores.
+    # If there are fewer blocks than S, we pick as many as exist.
+    # ----------------------------------------------------------------------------------------------
+
+    k = min(S, num_blocks)
+    top = torch.topk(scores, k=k, dim=-1).indices   # [B,T,H,k]
+    top, _ = torch.sort(top, dim=-1)                # sorted ascending for nicer printing
+
+    return top.to(torch.int32)
+
+
+# ==================================================================================================
+# 2) ASCII VISUALIZATION HELPER
+# ==================================================================================================
+#
+# This prints a simple text "map" so you can SEE block selection patterns.
+#
+# Each row is a token t.
+# Each column is a block id.
+# '#' means that block was selected for that token.
+#
+# Example output for 4 blocks:
+#   "##.#" means blocks 0,1,3 selected.
+# ==================================================================================================
+
+def ascii_blockmap(block_indices: torch.Tensor, BS: int, T_show: int = 128, b: int = 0, h: int = 0):
+    idx = block_indices[b, :T_show, h]  # [T_show, S]
+    num_blocks = (T_show + BS - 1) // BS
+
+    print("\n[ASCII Block Map] '#' means selected block for that token")
+    print(f"Showing b={b}, kv_head={h}, T_show={T_show}, blocks={num_blocks}, S={idx.shape[-1]}\n")
+
+    for t in range(T_show):
+        row = ["." for _ in range(num_blocks)]
+        for blk in idx[t].tolist():
+            if 0 <= blk < num_blocks:
+                row[blk] = "#"
+        print(f"{t:03d} " + "".join(row))
+
+
+# ==================================================================================================
+# 3) TILELANG SPARSE ATTENTION KERNEL (YOUR WORKING KERNEL)
+# ==================================================================================================
+#
+# What is this kernel doing conceptually?
+# --------------------------------------
+# We compute attention output for each token and head:
+#
+#   Attention(Q, K, V) = softmax(Q*K^T) * V
+#
+# Dense attention would use ALL past tokens in K and V.
+#
+# Here we do BLOCK SPARSE attention:
+#   - We only consider S selected blocks of size BS
+#   - For each selected block:
+#       1) load K block and V block into shared memory
+#       2) compute scores for that block: Q_block * K_block^T
+#       3) do a "streaming softmax" update across blocks
+#       4) multiply probabilities by V block and accumulate output
+#
+# Why streaming softmax?
+# ----------------------
+# Softmax normally needs all scores at once to compute:
+#   exp(score - max) / sum(exp(score - max))
+#
+# If we process blocks one by one, we can't store all scores.
+# So we maintain running statistics:
+#   - running max (scores_max)
+#   - running sum of exp(score - max) (logsum)
+#
+# That allows us to process block-by-block without storing the entire attention matrix.
+#
+# TileLang concepts used:
+# -----------------------
+# - T.alloc_shared: shared memory tile (fast, per-block)
+# - T.alloc_fragment: registers (very fast, per-thread)
+# - T.gemm: uses tensor cores / MMA under the hood
+# - T.Pipelined: software pipelining of loads/compute
+# ==================================================================================================
+
 tilelang.testing.set_random_seed(0)
 
-
 @tilelang.jit(
-    # out_idx=[-1] means: the last argument of the prim_func is the output buffer
     out_idx=[-1],
     pass_configs={
-        # Fast math allows faster approximate math (exp2, etc.)
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-        # Disable some advanced lowering/scheduling features for stability/simplicity
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     },
 )
-def native_sparse_attention(
-    batch,
-    heads,
-    seq_len,
-    dim,
-    is_causal,
-    scale=None,
-    block_size=64,
-    groups=1,
-    selected_blocks=16,
-):
-    # ------------------------------------------------------------
+def native_sparse_attention(batch, heads, seq_len, dim, is_causal, scale=None, block_size=64, groups=1, selected_blocks=16):
+
+    # ----------------------------------------------------------------------------------------------
     # Softmax scaling
-    # ------------------------------------------------------------
-    # Normally attention uses exp(x). Here code uses exp2(x).
-    # exp(x) = exp2(x * log2(e)) so we multiply scale by log2(e).
+    # ----------------------------------------------------------------------------------------------
+    # Standard attention uses:
+    #   score = (Q dot K) * (1/sqrt(dim))
+    #
+    # This kernel uses exp2() instead of exp() for speed:
+    #   exp(x) = exp2(x * log2(e))
+    #
+    # So we fold log2(e) into the scale.
+    # ----------------------------------------------------------------------------------------------
     if scale is None:
         scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     else:
         scale = scale * 1.44269504  # log2(e)
 
-    # ------------------------------------------------------------
-    # Grouped Query Attention (GQA) bookkeeping:
-    # - Q has `heads` heads
-    # - K/V have `head_kv = heads // groups` heads
-    # - Each KV head serves `groups` query heads
-    # ------------------------------------------------------------
+    # Number of KV heads in GQA
     head_kv = heads // groups
 
-    # Q and Output shapes: [B, T, HQ, D]
+    # Shapes are compile-time constants for the kernel
     q_shape = [batch, seq_len, heads, dim]
-    # K and V shapes: [B, T, H, D] where H = head_kv
     kv_shape = [batch, seq_len, head_kv, dim]
-
-    # Sparse block indices:
-    # BlockIndices[b, t, h, i] gives i-th selected BLOCK-ID for token t and KV head h.
-    # Kernel multiplies this block-id by BS to get token start i_s.
     block_indices_shape = [batch, seq_len, head_kv, selected_blocks]
+
     block_indices_dtype = T.int32
+    dtype = T.float16           # input/output in fp16
+    accum_dtype = T.float32     # accumulate in fp32 for stability
 
-    # Compute/storage dtypes
-    dtype = T.float16
-    accum_dtype = T.float32
+    BS = block_size             # tokens per block
+    BK = BV = min(128, tilelang.math.next_power_of_2(dim))  # tile size on D dimension
 
-    # ------------------------------------------------------------
-    # Tiling sizes
-    # ------------------------------------------------------------
-    # BS: number of tokens per block
-    block_S = block_size
-    # block_T: tile size along hidden dimension (power-of-2, capped at 128)
-    block_T = min(128, tilelang.math.next_power_of_2(dim))
-
-    # NK/NV: number of tiles along D for K and V (ceil division)
-    NK = tilelang.cdiv(dim, block_T)
-    NV = tilelang.cdiv(dim, block_T)
-
-    # This implementation assumes dim fits in one tile (NK==1).
+    # This kernel assumes dim <= 256 (in this configuration NK==1)
+    NK = tilelang.cdiv(dim, BK)
+    NV = tilelang.cdiv(dim, BV)
     assert NK == 1, "The key dimension can not be larger than 256"
 
-    # Aliases
-    S = selected_blocks   # number of selected blocks per query token
-    G = groups            # number of Q heads per KV head
-    BS = block_S          # tokens per selected block
-    BK = BV = block_T     # channels per tile for K and V/O
+    S = selected_blocks         # number of blocks per token
+    G = groups                  # number of Q heads per KV head
+    num_stages = 2              # pipeline stages
+    threads = 32                # one warp per "instance"
 
-    # Pipelining settings
-    num_stages = 2 if selected_blocks >= 2 else 1
-    # 32 threads = one warp per CTA (simple baseline)
-    threads = 32
-
-    # ------------------------------------------------------------
-    # The actual GPU kernel (TIR / prim_func)
-    # ------------------------------------------------------------
     @T.prim_func
     def native_sparse_attention(
         Q: T.Tensor(q_shape, dtype),
@@ -113,49 +354,65 @@ def native_sparse_attention(
         BlockIndices: T.Tensor(block_indices_shape, block_indices_dtype),
         Output: T.Tensor(q_shape, dtype),
     ):
-        # --------------------------------------------------------
-        # Kernel launch grid:
-        #   bx in [0..seq_len)          -> token index i_t
-        #   by in [0..NV)               -> V/O tile index i_v
-        #   bz in [0..batch*head_kv)    -> combined (batch, kv_head)
-        # --------------------------------------------------------
+        # ------------------------------------------------------------------------------------------
+        # Kernel launch geometry
+        # ------------------------------------------------------------------------------------------
+        # T.Kernel(seq_len, NV, batch * head_kv, threads=threads)
+        #
+        # Means our 3D grid is:
+        #   bx in [0 .. seq_len-1]              token index
+        #   by in [0 .. NV-1]                   tile index along D for output
+        #   bz in [0 .. batch*head_kv - 1]      combined batch/head index
+        #
+        # One warp handles:
+        #   one token position (bx)
+        #   one output tile along D (by)
+        #   one (batch, kv_head) (bz)
+        # ------------------------------------------------------------------------------------------
         with T.Kernel(seq_len, NV, batch * head_kv, threads=threads) as (bx, by, bz):
 
-            # -------------------------
-            # Shared memory buffers
-            # -------------------------
-            # Q_shared holds G query heads for this token (one token t)
-            Q_shared = T.alloc_shared([G, BK], dtype)
-            # K_shared holds one selected K block (BS tokens)
-            K_shared = T.alloc_shared([BS, BK], dtype)
-            # V_shared holds one selected V block (BS tokens), but only BV channels of this i_v tile
-            V_shared = T.alloc_shared([BS, BV], dtype)
-            # O_shared is a staging area before writing output
-            O_shared = T.alloc_shared([G, BV], dtype)
+            # --------------------------------------------------------------------------------------
+            # Shared memory tiles
+            # --------------------------------------------------------------------------------------
+            # Shared memory is much faster than global memory.
+            # We load the active Q/K/V tiles here to reuse them during compute.
+            # --------------------------------------------------------------------------------------
+            Q_shared = T.alloc_shared([G, BK], dtype)      # Q tile for all G query heads
+            K_shared = T.alloc_shared([BS, BK], dtype)     # K tile for one selected block
+            V_shared = T.alloc_shared([BS, BV], dtype)     # V tile for one selected block
+            O_shared = T.alloc_shared([G, BV], dtype)      # intermediate output tile
 
-            # -------------------------
+            # --------------------------------------------------------------------------------------
             # Register fragments
-            # -------------------------
-            # acc_s: [G, BS] - attention scores/probs for this block
+            # --------------------------------------------------------------------------------------
+            # Registers are fastest storage. T.alloc_fragment maps to registers.
+            #
+            # acc_s: attention scores / probabilities for [G, BS]
+            # acc_o: output accumulator for [G, BV]
+            # --------------------------------------------------------------------------------------
             acc_s = T.alloc_fragment([G, BS], accum_dtype)
-            # acc_s_cast: fp16 probs for fast GEMM with V
-            acc_s_cast = T.alloc_fragment([G, BS], dtype)
-            # acc_o: [G, BV] - output accumulator tile (numerator of attention)
+            acc_s_cast = T.alloc_fragment([G, BS], dtype)      # fp16 probs for gemm
             acc_o = T.alloc_fragment([G, BV], accum_dtype)
 
-            # Streaming softmax state per head (length G)
-            scores_max = T.alloc_fragment([G], accum_dtype)       # running max
-            scores_max_prev = T.alloc_fragment([G], accum_dtype)  # previous running max
-            scores_scale = T.alloc_fragment([G], accum_dtype)     # rescale factor when max changes
-            scores_sum = T.alloc_fragment([G], accum_dtype)       # sum of exp2(...) within a block
-            logsum = T.alloc_fragment([G], accum_dtype)           # running denominator across blocks
+            # --------------------------------------------------------------------------------------
+            # Streaming softmax variables per query-head-group (size G)
+            # --------------------------------------------------------------------------------------
+            scores_max = T.alloc_fragment([G], accum_dtype)
+            scores_max_prev = T.alloc_fragment([G], accum_dtype)
+            scores_scale = T.alloc_fragment([G], accum_dtype)
+            scores_sum = T.alloc_fragment([G], accum_dtype)
+            logsum = T.alloc_fragment([G], accum_dtype)
 
             # Decode indices
             i_t, i_v, i_bh = bx, by, bz
             i_b, i_h = i_bh // head_kv, i_bh % head_kv
 
-            # Load Q vectors for the G query heads served by KV head i_h
-            # Slice heads: [i_h*G : (i_h+1)*G]
+            # --------------------------------------------------------------------------------------
+            # Load Q for this token and kv head group
+            # --------------------------------------------------------------------------------------
+            # Q has HQ heads; each kv head corresponds to G query heads:
+            #   q heads range: [i_h*G : (i_h+1)*G]
+            # --------------------------------------------------------------------------------------
             T.copy(Q[i_b, i_t, i_h * G : (i_h + 1) * G, :], Q_shared)
 
             # Initialize accumulators
@@ -163,25 +420,32 @@ def native_sparse_attention(
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
 
-            # Iterate over S selected blocks for this token
+            # --------------------------------------------------------------------------------------
+            # Loop over selected blocks (sparse pattern)
+            # --------------------------------------------------------------------------------------
+            # BlockIndices gives BLOCK IDs.
+            # Convert block_id -> start token index by multiplying with BS.
+            #
+            # We process block by block:
+            #   - load K block
+            #   - compute scores
+            #   - update softmax state
+            #   - load V block
+            #   - accumulate output
+            # --------------------------------------------------------------------------------------
             for si in T.Pipelined(S, num_stages=num_stages):
 
-                # Convert block-id to token start index
-                i_s = BlockIndices[i_b, i_t, i_h, si] * BS
+                i_s = BlockIndices[i_b, i_t, i_h, si] * BS  # block start token index
 
-                # ------------------------------------------------------------
-                # Guard: only process valid blocks.
-                # Original had: (i_s <= i_t and i_s >= 0)
-                # Added explicit OOB guard: (i_s + BS <= seq_len)
-                # This prevents K/V loads from reading past end.
-                # ------------------------------------------------------------
-                if (i_s <= i_t) and (i_s >= 0) and (i_s + BS <= seq_len):
+                # Guard:
+                # - causal: start must be <= current token
+                # - in-bounds: start+BS must not exceed seq_len
+                if (i_s <= i_t) and (i_s >= 0) and ((i_s + BS) <= seq_len):
 
-                    # Load K block [i_s : i_s+BS] into shared
+                    # Load K tile for this block into shared memory
                     T.copy(K[i_b, i_s : i_s + BS, i_h, :], K_shared)
 
-                    # Causal mask inside the block:
-                    # If key position (i_s + j) > i_t, mask it to -inf.
+                    # Apply causal masking inside the block if needed
                     if is_causal:
                         for gi, j in T.Parallel(G, BS):
                             acc_s[gi, j] = T.if_then_else(
@@ -190,73 +454,86 @@ def native_sparse_attention(
                                 -T.infinity(acc_s.dtype),
                             )
                     else:
-                        # Non-causal: no mask bias, start at 0
                         T.clear(acc_s)
 
-                    # Scores: acc_s += Q_shared @ K_shared^T
+                    # Compute scores: acc_s += Q_shared @ K_shared^T
                     T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                    # -------------------------
+                    # ------------------------------
                     # Streaming softmax update
-                    # -------------------------
-                    # Save previous max
+                    # ------------------------------
+                    # 1) Keep previous max
                     T.copy(scores_max, scores_max_prev)
 
-                    # Compute new max over scores in this block
+                    # 2) Find new max for this block
                     T.fill(scores_max, -T.infinity(accum_dtype))
                     T.reduce_max(acc_s, scores_max, dim=1, clear=True)
 
-                    # Rescale factor for previous accumulators when max changes:
-                    # scale_prev = exp2(prev_max*scale - new_max*scale)
+                    # 3) Compute scale factor to rescale old contributions if max changes
                     for gi in T.Parallel(G):
                         scores_scale[gi] = T.exp2(scores_max_prev[gi] * scale - scores_max[gi] * scale)
 
-                    # Convert scores -> exp2(score*scale - max*scale)
+                    # 4) Exponentiate scores relative to max (stable)
                     for gi, j in T.Parallel(G, BS):
                         acc_s[gi, j] = T.exp2(acc_s[gi, j] * scale - scores_max[gi] * scale)
 
-                    # Sum exp2(...) within this block
+                    # 5) Sum exp scores for normalization update
                     T.reduce_sum(acc_s, scores_sum, dim=1)
 
-                    # Update running denominator:
-                    # logsum = logsum * scores_scale + scores_sum
+                    # 6) Update running denominator
                     for gi in T.Parallel(G):
                         logsum[gi] = logsum[gi] * scores_scale[gi] + scores_sum[gi]
 
-                    # Cast probs to fp16 for V GEMM
+                    # Cast probabilities to fp16 for the V multiply GEMM
                     T.copy(acc_s, acc_s_cast)
 
-                    # Rescale output accumulator by scores_scale (same reason as logsum rescale)
+                    # Rescale output accumulator because denominator/max changed
                     for gi, j in T.Parallel(G, BV):
                         acc_o[gi, j] *= scores_scale[gi]
 
-                    # Load V block tile (only BV channels for this i_v tile)
+                    # Load V tile and do: acc_o += probs @ V
                     T.copy(V[i_b, i_s : i_s + BS, i_h, i_v * BV : (i_v + 1) * BV], V_shared)
-
-                    # Output accumulate: acc_o += probs @ V
                     T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-            # Final normalization: divide numerator by denominator
-            eps = T.cast(1e-6, accum_dtype)
+            # Final normalization: divide by running denominator
             for gi, j in T.Parallel(G, BV):
-                acc_o[gi, j] /= (logsum[gi] + eps)
+                acc_o[gi, j] /= (logsum[gi] + 1e-6)
 
-            # Store output tile
+            # Store output
             T.copy(acc_o, O_shared)
-            T.copy(
-                O_shared,
-                Output[i_b, i_t, i_h * G : (i_h + 1) * G, i_v * BV : (i_v + 1) * BV],
-            )
+            T.copy(O_shared, Output[i_b, i_t, i_h * G : (i_h + 1) * G, i_v * BV : (i_v + 1) * BV])
 
-    # Return the compiled prim_func
     return native_sparse_attention
 
 
-def main():
-    # Test config
-    B, SEQ_LEN, H, HQ, D, S, block_size, dtype, scale = 2, 64, 1, 16, 32, 1, 32, torch.float16, 0.1
+# ==================================================================================================
+# 4) DEMO MAIN
+# ==================================================================================================
+#
+# What this does:
+#   - sets a demo configuration that creates many blocks
+#   - compiles the TileLang kernel
+#   - creates random Q/K/V
+#   - builds block indices with content-based Top-K
+#   - prints selected block IDs for some tokens
+#   - prints ASCII map of block selection
+#   - warms up and benchmarks kernel with CUDA events
+#   - prints output statistics and a sample
+# ==================================================================================================
 
-    # Compile kernel for this configuration
+def main():
+    # Use a configuration where block selection becomes visible:
+    # T=512, BS=32 => 16 blocks total
+    B, SEQ_LEN, H, HQ, D = 2, 512, 1, 16, 32
+    block_size = 32
+    S = 8
+    dtype = torch.float16
+    scale = 0.1
+    groups = HQ // H
+
+    print("GPU:", torch.cuda.get_device_name(0), "cap:", torch.cuda.get_device_capability(0))
+
+    # Compile kernel (happens once per configuration)
     kernel = native_sparse_attention(
         batch=B,
         heads=HQ,
@@ -264,39 +541,63 @@ def main():
         dim=D,
         is_causal=True,
         block_size=block_size,
-        groups=HQ // H,
+        groups=groups,
         selected_blocks=S,
         scale=scale,
     )
 
-    
-
     # Create inputs
-    torch.random.manual_seed(0)
+    torch.manual_seed(0)
     Q = torch.randn((B, SEQ_LEN, HQ, D), dtype=dtype, device="cuda")
     K = torch.randn((B, SEQ_LEN, H, D), dtype=dtype, device="cuda")
     V = torch.randn((B, SEQ_LEN, H, D), dtype=dtype, device="cuda")
 
-    # Sparse indices: sentinel is SEQ_LEN (invalid); guard should skip it
-    block_indices = torch.full((B, SEQ_LEN, H, S), SEQ_LEN, dtype=torch.long, device="cuda")
-    for b in range(B):
-        for t in range(SEQ_LEN):
-            for h in range(H):
-                i_i = torch.randperm(max(1, (t // block_size)), device="cuda")[:S]
-                block_indices[b, t, h, : len(i_i)] = i_i
+    # Build content-based Top-K block indices
+    block_indices = build_block_indices_topk(
+        Q=Q,
+        K=K,
+        block_size=block_size,
+        selected_blocks=S,
+        groups=groups,
+        summary="mean",
+        add_local=2,  # always include last 2 blocks
+    )
 
-    block_indices = block_indices.sort(-1)[0].to(torch.int32)
+    # Show selected blocks for a few tokens
+    b, h = 0, 0
+    print("\nSelected blocks (b=0, kv_head=0) for a few tokens:")
+    for t in [0, 1, 15, 31, 32, 33, 63, 127, 255, 511]:
+        print(f"t={t:>3}  blk_ids={block_indices[b, t, h].cpu().tolist()}")
 
-    # Run kernel (async)
-    # out = kernel(Q, K, V, block_indices)
+    # Visualize selection for first 128 tokens
+    ascii_blockmap(block_indices, BS=block_size, T_show=128, b=0, h=0)
 
-    # 2) Force synchronization so we KNOW the kernel finished
-    # torch.cuda.synchronize()
-
-    out = kernel(Q, K, V, block_indices.to(torch.int32))
+    # Warmup runs (helps stabilize performance measurement)
+    for _ in range(20):
+        out = kernel(Q, K, V, block_indices)
     torch.cuda.synchronize()
-    print("ran kernel, out shape:", tuple(out.shape))
-    print("sample:", out[0, 0, 0, :8].float().cpu())
+
+    # Benchmark using CUDA events (accurate GPU timing)
+    iters = 200
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+    for _ in range(iters):
+        out = kernel(Q, K, V, block_indices)
+    end.record()
+
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end)
+    print(f"\nKernel time: {ms/iters:.4f} ms/iter  (avg over {iters} iters)")
+
+    # Output sanity checks
+    print("out shape:", tuple(out.shape))
+    print("finite:", torch.isfinite(out).all().item())
+    print("mean/std:", out.float().mean().item(), out.float().std().item())
+
+    # Print a small slice of output (demo output)
+    print("sample:", out[0, 0, 0, :8].float().cpu().tolist())
 
 
 if __name__ == "__main__":
