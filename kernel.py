@@ -42,7 +42,7 @@ import torch
 import tilelang
 from tilelang import language as T
 import tilelang.testing
-
+import matplotlib.pyplot as plt
 
 # ==================================================================================================
 # 1) CONTENT-BASED TOP-K BLOCK INDEXER  (Option 2)
@@ -238,19 +238,57 @@ def build_block_indices_topk(
 #   "##.#" means blocks 0,1,3 selected.
 # ==================================================================================================
 
-def ascii_blockmap(block_indices: torch.Tensor, BS: int, T_show: int = 128, b: int = 0, h: int = 0):
-    idx = block_indices[b, :T_show, h]  # [T_show, S]
-    num_blocks = (T_show + BS - 1) // BS
+def ascii_blockmap(
+    block_indices: torch.Tensor,
+    BS: int,
+    T_show: int = 128,
+    start_t: int = 0,       # NEW: where to start visualization
+    b: int = 0,
+    h: int = 0,
+    show_ids: bool = False  # NEW: optionally print actual block IDs
+):
+    """
+    Visualize which key-blocks are selected per token.
+
+    block_indices: [B, T, KV_heads, S]
+    BS: block_size
+    T_show: how many tokens to display
+    start_t: starting token index (IMPORTANT for interesting region)
+    b: batch index
+    h: kv head index
+    show_ids: if True, prints selected block ids per token
+    """
+
+    T_total = block_indices.shape[1]
+    end_t = min(start_t + T_show, T_total)
+
+    idx = block_indices[b, start_t:end_t, h]  # [T_show, S]
+
+    # Total blocks in full sequence
+    num_blocks = (T_total + BS - 1) // BS
 
     print("\n[ASCII Block Map] '#' means selected block for that token")
-    print(f"Showing b={b}, kv_head={h}, T_show={T_show}, blocks={num_blocks}, S={idx.shape[-1]}\n")
+    print(
+        f"Showing tokens {start_t}..{end_t-1} "
+        f"(b={b}, kv_head={h}, total_blocks={num_blocks}, S={idx.shape[-1]})\n"
+    )
 
-    for t in range(T_show):
+    for local_t in range(idx.shape[0]):
+        global_t = start_t + local_t
         row = ["." for _ in range(num_blocks)]
-        for blk in idx[t].tolist():
+
+        selected = idx[local_t].tolist()
+        for blk in selected:
             if 0 <= blk < num_blocks:
                 row[blk] = "#"
-        print(f"{t:03d} " + "".join(row))
+
+        line = f"{global_t:04d} " + "".join(row)
+
+        if show_ids:
+            line += f"   {selected}"
+
+        print(line)
+
 
 
 # ==================================================================================================
@@ -505,6 +543,47 @@ def native_sparse_attention(batch, heads, seq_len, dim, is_causal, scale=None, b
 
     return native_sparse_attention
 
+def plot_block_selection_heatmap(
+    block_indices: torch.Tensor,  # [B, T, H, S] int32
+    block_size: int,
+    b: int = 0,
+    h: int = 0,
+    start_t: int = 0,
+    T_show: int = 256,
+    title: str = "Block selection heatmap (token × block)",
+):
+    """
+    Visualize selection as a binary heatmap:
+      y-axis: token index t
+      x-axis: block id
+      value: 1 if block selected for token, else 0
+
+    Works great for showing late-sequence behavior:
+      start_t = T - 256, T_show = 256
+    """
+    assert block_indices.ndim == 4, "Expected [B, T, H, S]"
+    B, T, H, S = block_indices.shape
+    end_t = min(start_t + T_show, T)
+    idx = block_indices[b, start_t:end_t, h]  # [T_show, S]
+
+    num_blocks = (T + block_size - 1) // block_size
+
+    # Build binary matrix M[t, block] = 1 if selected
+    M = torch.zeros((end_t - start_t, num_blocks), device="cpu", dtype=torch.float32)
+
+    # Fill selected blocks
+    # (We clamp to valid range just in case)
+    blk = idx.to("cpu").clamp(min=0, max=num_blocks - 1)  # [T_show, S]
+    t_ids = torch.arange(end_t - start_t).unsqueeze(1).repeat(1, S)  # [T_show, S]
+    M[t_ids, blk] = 1.0
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(M.numpy(), aspect="auto", interpolation="nearest")  # default colormap
+    plt.xlabel("Block ID")
+    plt.ylabel("Token t (windowed)")
+    plt.title(f"{title} | b={b}, kv_head={h}, t=[{start_t}..{end_t-1}], blocks={num_blocks}, S={S}")
+    plt.colorbar(label="selected (1) / not selected (0)")
+    plt.show()
 
 # ==================================================================================================
 # 4) DEMO MAIN
@@ -571,6 +650,14 @@ def main():
 
     # Visualize selection for first 128 tokens
     ascii_blockmap(block_indices, BS=block_size, T_show=128, b=0, h=0)
+
+    plot_block_selection_heatmap(
+        block_indices,
+        block_size=block_size,
+        b=0, h=0,
+        start_t=SEQ_LEN - 256,
+        T_show=256,
+    )
 
     # Warmup runs (helps stabilize performance measurement)
     for _ in range(20):
