@@ -1,5 +1,8 @@
 At a high level, for each query token t, instead of attending to all past keys 0..t, it attends only to a small list of selected key blocks (like DeepSeek/NSA style): selected_blocks = S.
 
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/2bea1bf8-0bd1-4dd7-af3a-334a1f3be40f" />
+
+
 ## Imports
 ```python
 import torch
