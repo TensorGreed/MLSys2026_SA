@@ -520,6 +520,316 @@ def train_router(router, Q, K, *, BS=64, groups=4, steps=400, lr=3e-3, summary="
             print(f"step {step:4d} | loss {loss.item():.6f} | router entropy {entropy:.3f}")
 
     router.eval()
+
+# -----------------------------------------------------------------------------
+# Helper: scaled dot product attention, written explicitly for clarity
+# -----------------------------------------------------------------------------
+def dense_attention_output(Qrep, K, V, is_causal=True, scale=None):
+    """
+    Compute FULL dense attention output for Qrep against K/V.
+
+    Shapes:
+      Qrep: [B, T, H, D]   (representative queries per KV head)
+      K:    [B, T, H, D]
+      V:    [B, T, H, D]
+
+    Output:
+      O:    [B, T, H, D]
+
+    Notes:
+      - This is the "teacher" output. It's expensive: O(T^2).
+      - We keep it in float for numerical stability, then cast back if desired.
+    """
+    B, T, H, D = Qrep.shape
+    assert K.shape == (B, T, H, D)
+    assert V.shape == (B, T, H, D)
+
+    # Default scale is 1/sqrt(D) like standard attention.
+    if scale is None:
+        scale = 1.0 / (D ** 0.5)
+
+    # logits[b,t,h,k] = dot(Qrep[b,t,h,:], K[b,k,h,:])
+    logits = torch.einsum("bthd,bkhd->bthk", Qrep.float(), K.float()) * scale
+
+    # Causal mask: disallow attending to future tokens (k > t)
+    if is_causal:
+        t_idx = torch.arange(T, device=Qrep.device).view(1, T, 1, 1)
+        k_idx = torch.arange(T, device=Qrep.device).view(1, 1, 1, T)
+        logits = logits.masked_fill(k_idx > t_idx, float("-inf"))
+
+    # Attention probabilities across k
+    P = torch.softmax(logits, dim=-1)  # [B,T,H,T]
+
+    # Weighted sum of values
+    O = torch.einsum("bthk,bkhd->bthd", P, V.float())  # [B,T,H,D]
+    return O
+
+
+# -----------------------------------------------------------------------------
+# Differentiable "router-gated" attention:
+# We do dense attention, BUT we add a block prior from the router.
+# That makes the output depend on router parameters (Wq/Wk/logit_scale).
+# -----------------------------------------------------------------------------
+def block_gated_attention_output(Qrep, K, V, P_blocks, block_size, is_causal=True, scale=None, eps=1e-9):
+    """
+    Compute attention output where routing selects blocks SOFTLY (differentiable).
+
+    Shapes:
+      Qrep:    [B, T, H, D]
+      K, V:    [B, T, H, D]
+      P_blocks:[B, T, H, NB]   router probability over blocks for each token
+
+    block_size (BS):
+      - Tokens 0..BS-1 are in block 0
+      - Tokens BS..2BS-1 are in block 1
+      - etc.
+
+    Output:
+      O_gated: [B, T, H, D]
+
+    The key idea:
+      - compute token logits as usual: q·k
+      - compute a per-token per-key "block bias" = log(P_blocks[t, block(k)])
+      - add that bias to logits BEFORE softmax
+      - now router influences which keys get probability mass (differentiably)
+
+    Why log-space?
+      - Multiplying probs is adding logs:
+          softmax(qk) * P_block_prior  ->  logits + log(prior)
+      - This behaves like a Bayesian prior over blocks.
+    """
+    B, T, H, D = Qrep.shape
+    assert K.shape == (B, T, H, D)
+    assert V.shape == (B, T, H, D)
+
+    NB = P_blocks.shape[-1]
+    assert P_blocks.shape == (B, T, H, NB)
+
+    if scale is None:
+        scale = 1.0 / (D ** 0.5)
+
+    # ------------------------------------------------------------
+    # (1) Dense token logits: [B,T,H,T]
+    # ------------------------------------------------------------
+    logits = torch.einsum("bthd,bkhd->bthk", Qrep.float(), K.float()) * scale
+
+    # ------------------------------------------------------------
+    # (2) Build "block id for each key token k"
+    #     key_block[k] = k // BS
+    #     shape: [T]
+    # ------------------------------------------------------------
+    key_block = (torch.arange(T, device=Qrep.device) // block_size).clamp(max=NB-1)  # [T]
+
+    # ------------------------------------------------------------
+    # (3) Convert block probabilities to log-priors:
+    #     log_prior[b,t,h,k] = log(P_blocks[b,t,h, key_block[k]])
+    #
+    #     We gather along the block dimension using key_block.
+    # ------------------------------------------------------------
+    # P_blocks: [B,T,H,NB]
+    # gather index must be broadcastable to [B,T,H,T]
+    gather_index = key_block.view(1, 1, 1, T).expand(B, T, H, T)
+    log_prior = torch.gather(P_blocks.clamp_min(eps).log(), dim=-1, index=gather_index)
+
+    # ------------------------------------------------------------
+    # (4) Add router prior into logits:
+    #     If router thinks a block is important, log_prior is higher,
+    #     increasing attention mass to tokens in that block.
+    # ------------------------------------------------------------
+    logits = logits + log_prior
+
+    # ------------------------------------------------------------
+    # (5) Causal mask remains valid
+    # ------------------------------------------------------------
+    if is_causal:
+        t_idx = torch.arange(T, device=Qrep.device).view(1, T, 1, 1)
+        k_idx = torch.arange(T, device=Qrep.device).view(1, 1, 1, T)
+        logits = logits.masked_fill(k_idx > t_idx, float("-inf"))
+
+    # ------------------------------------------------------------
+    # (6) Softmax and output
+    # ------------------------------------------------------------
+    P = torch.softmax(logits, dim=-1)  # [B,T,H,T]
+    O = torch.einsum("bthk,bkhd->bthd", P, V.float())
+    return O
+
+
+# -----------------------------------------------------------------------------
+# Entropy regularization on router distributions
+# -----------------------------------------------------------------------------
+def router_entropy(P_blocks, eps=1e-9):
+    """
+    Compute mean entropy of router distribution over blocks.
+
+    P_blocks: [B, T, H, NB]
+    Entropy per (b,t,h):  -sum_n p[n] log p[n]
+
+    Interpreting entropy:
+      - High entropy  -> router is unsure / spreads mass across many blocks
+      - Low entropy   -> router is confident / peaky (more sparse-like)
+
+    For "sparsity", we usually ADD entropy as a penalty to minimize it.
+    """
+    P = P_blocks.clamp_min(eps)
+    H = -(P * P.log()).sum(dim=-1)      # [B,T,H]
+    return H.mean()
+
+
+# -----------------------------------------------------------------------------
+# JOINT training: match dense output (teacher) and encourage sparse routing
+# -----------------------------------------------------------------------------
+def train_router_joint(
+    router,
+    Q, K, V,
+    *,
+    BS=64,
+    groups=None,
+    steps=200,
+    lr=3e-3,
+    summary="mean",
+    is_causal=True,
+    alpha_block_kl=0.1,     # weight for block KL (optional but useful)
+    beta_entropy=0.01,      # weight for entropy penalty (sparsity pressure)
+    print_every=25
+):
+    """
+    Train router with TWO key signals:
+
+    (A) Output distillation (joint with attention output loss):
+        Make router-gated attention output match dense attention output.
+
+        - Teacher: dense_attention_output(Qrep,K,V)
+        - Student: block_gated_attention_output(Qrep,K,V,P_router)
+
+        Loss_out = MSE(student_output, teacher_output)
+
+    (B) Block distribution matching (optional but very stabilizing):
+        Compare router's block probs to teacher's block probs derived from dense attention.
+
+        Loss_kl = KL(P_teacher_blocks || P_router_blocks)
+
+    (C) Entropy regularization:
+        Encourage router distribution to be peaky (lower entropy).
+        Loss_ent = Entropy(P_router_blocks)
+
+    Final:
+        Loss = Loss_out + alpha*Loss_kl + beta*Loss_ent
+
+    Notes:
+      - This is "joint" in the sense that router is trained using OUTPUT mismatch,
+        not only by matching distributions.
+      - We are NOT backpropagating through TileLang kernel (hard indices).
+        We use differentiable block-gated attention as the training surrogate.
+    """
+    device = Q.device
+    B, T, HQ, Dq = Q.shape
+    assert K.shape[:2] == (B, T)
+    assert V.shape[:2] == (B, T)
+
+    H = K.shape[2]
+    Dk = K.shape[-1]
+    assert Dq == Dk, f"Q/K dim mismatch: {Dq} vs {Dk}"
+    assert HQ % H == 0, f"HQ({HQ}) must be divisible by H({H})"
+
+    # groups = how many query heads share one KV head (GQA)
+    if groups is None:
+        groups = HQ // H
+    assert groups == (HQ // H), "groups must equal HQ//H"
+
+    # ------------------------------------------------------------
+    # Representative Q per KV head:
+    # For KV head h, we pick Q head index (h*groups).
+    # This is exactly the mapping your sparse kernel assumes.
+    # ------------------------------------------------------------
+    rep_qh = torch.arange(H, device=device) * groups
+    Qrep = Q[:, :, rep_qh, :]  # [B,T,H,D]
+
+    router.train()
+    opt = torch.optim.AdamW(router.parameters(), lr=lr, weight_decay=1e-4)
+
+    # Fixed attention scale (standard)
+    scale = 1.0 / (Dq ** 0.5)
+
+    for step in range(steps):
+        opt.zero_grad(set_to_none=True)
+
+        # --------------------------------------------------------
+        # 1) Router logits over blocks (differentiable)
+        #    This should output logits_blk: [B,T,H,NB]
+        # --------------------------------------------------------
+        logits_blk, _ = router_logits_over_blocks(
+            router, Q, K, BS, groups, summary=summary, is_causal=is_causal
+        )
+
+        # Convert logits -> probabilities over blocks
+        P_router = torch.softmax(logits_blk, dim=-1)  # [B,T,H,NB]
+
+        # --------------------------------------------------------
+        # 2) Teacher: full dense attention output (expensive)
+        # --------------------------------------------------------
+        with torch.no_grad():
+            O_teacher = dense_attention_output(Qrep, K, V, is_causal=is_causal, scale=scale)  # [B,T,H,D]
+
+        # --------------------------------------------------------
+        # 3) Student: router-gated attention output (differentiable)
+        # --------------------------------------------------------
+        O_student = block_gated_attention_output(
+            Qrep, K, V,
+            P_blocks=P_router,
+            block_size=BS,
+            is_causal=is_causal,
+            scale=scale
+        )  # [B,T,H,D]
+
+        # --------------------------------------------------------
+        # 4) Output distillation loss: match attention outputs
+        # --------------------------------------------------------
+        loss_out = F.mse_loss(O_student, O_teacher)
+
+        # --------------------------------------------------------
+        # 5) Optional: block teacher distribution + KL loss
+        #    This stabilizes routing early in training.
+        # --------------------------------------------------------
+        if alpha_block_kl > 0:
+            with torch.no_grad():
+                P_teacher = dense_block_teacher(Qrep, K, BS, is_causal=is_causal)  # [B,T,H,NB]
+
+            # KL(P_teacher || P_router)
+            loss_kl = torch.sum(
+                P_teacher * (torch.log(P_teacher + 1e-9) - torch.log(P_router + 1e-9)),
+                dim=-1
+            ).mean()
+        else:
+            loss_kl = torch.tensor(0.0, device=device)
+
+        # --------------------------------------------------------
+        # 6) Entropy regularization: encourage peaky routing
+        # --------------------------------------------------------
+        loss_ent = router_entropy(P_router)
+
+        # --------------------------------------------------------
+        # 7) Total loss
+        # --------------------------------------------------------
+        loss = loss_out + alpha_block_kl * loss_kl + beta_entropy * loss_ent
+        loss.backward()
+        opt.step()
+
+        # --------------------------------------------------------
+        # 8) Logging: show signals so you know training is real
+        # --------------------------------------------------------
+        if step % print_every == 0 or step == steps - 1:
+            with torch.no_grad():
+                ent = loss_ent.item()
+                print(
+                    f"step {step:4d} | "
+                    f"loss={loss.item():.6f} | "
+                    f"out_mse={loss_out.item():.6f} | "
+                    f"blk_kl={loss_kl.item():.6f} | "
+                    f"entropy={ent:.4f}"
+                )
+
+    router.eval()
+    return router
     
 # ==================================================================================================
 # 1) CONTENT-BASED TOP-K BLOCK INDEXER  (Option 2)
@@ -1126,24 +1436,25 @@ def main():
     print("K shape:", tuple(K.shape))
     assert Q.shape[-1] == K.shape[-1]
 
-    # Source of truth: tensors
-    H_actual  = K.shape[2]
+    # Derive H/HQ/groups from tensors (avoid notebook drift)
     HQ_actual = Q.shape[2]
-    D_actual  = Q.shape[-1]
-    
-    assert HQ_actual % H_actual == 0
+    H_actual  = K.shape[2]
     groups = HQ_actual // H_actual
     
-    print("Q:", tuple(Q.shape), "K:", tuple(K.shape))
-    print("H_actual:", H_actual, "HQ_actual:", HQ_actual, "groups:", groups, "D_actual:", D_actual)
-    
-    # IMPORTANT: kv_heads must equal H_actual (not some stale H variable)
+    D_actual = Q.shape[-1]
     router = MiniDSARouter(dim=D_actual, dr=16, kv_heads=H_actual).to("cuda")
     
-    train_router(router, Q, K, BS=BS, groups=groups, steps=400, lr=3e-3, summary="mean")
-    
-    # router = MiniDSARouter(dim=D, dr=16, kv_heads=H).to("cuda")
-    # train_router(router, Q, K, BS=BS, groups=groups, steps=400, lr=3e-3, summary="mean")
+    # Joint train (output loss + entropy)
+    train_router_joint(
+        router, Q, K, V,
+        BS=block_size,
+        groups=groups,
+        steps=200,           # start small
+        lr=3e-3,
+        summary="mean",
+        alpha_block_kl=0.1,  # stabilizer
+        beta_entropy=0.01,   # sparsity pressure
+    )
 
     block_indices = router.hard_topk_blocks(
         Q, K, 
