@@ -43,7 +43,484 @@ import tilelang
 from tilelang import language as T
 import tilelang.testing
 import matplotlib.pyplot as plt
+import torch.nn as nn
+import torch.nn.functional as F
 
+
+class MiniDSARouter(nn.Module):
+    """
+    Mini-DSA Router (Learned Projection + Learned Routing)
+    ------------------------------------------------------
+
+    Goal:
+      Produce BlockIndices[b, t, kv_head, s] = which *key blocks* each query token should attend to.
+
+    Key idea:
+      Instead of comparing Q to *all keys* (T tokens),
+      we compare Q to *block summaries* (num_blocks blocks),
+      BUT we do the comparison in a *learned low-dimensional routing space*.
+
+    This approximates "DeepSeek-like" dynamic sparse attention at a conceptual level:
+      - We learn a routing space (small dim Dr)
+      - We score (Q_routing dot K_routing) for each block
+      - We pick Top-K blocks dynamically per token
+
+    Important:
+      This module does NOT change your TileLang kernel.
+      It only produces the block_indices that you feed into the kernel.
+
+    Shapes (common in your setup):
+      Q: [B, T, HQ, D]   (many query heads)
+      K: [B, T, H,  D]   (fewer KV heads in GQA)
+      groups = HQ // H   (how many Q heads share one KV head)
+
+    Router output:
+      block_indices: [B, T, H, S]  (S selected blocks per token per KV head)
+    """
+
+    def __init__(self, dim: int, dr: int, kv_heads: int):
+        """
+        dim:     D, original head dimension (e.g., 64)
+        dr:      Dr, routing dimension (small, e.g., 8, 16, 32)
+                 Smaller = cheaper + more bottleneck (often good for routing)
+                 Larger = potentially more accurate but more compute
+        kv_heads: H, number of KV heads
+        """
+        super().__init__()
+
+        # These are the learned projection matrices.
+        #
+        # For each KV head h:
+        #   - Wq[h] maps a query vector from D -> Dr
+        #   - Wk[h] maps a block-summary key vector from D -> Dr
+        #
+        # Using per-head matrices is more flexible (and still tiny).
+        #
+        # Shapes:
+        #   Wq: [H, D, Dr]
+        #   Wk: [H, D, Dr]
+        self.Wq = nn.Parameter(torch.randn(kv_heads, dim, dr) * 0.02)
+        self.Wk = nn.Parameter(torch.randn(kv_heads, dim, dr) * 0.02)
+
+        # Optional learned temperature/scale per head.
+        # Multiplying scores by exp(logit_scale[h]) lets each head learn
+        # how sharp or soft its routing distribution should be.
+        self.logit_scale = nn.Parameter(torch.zeros(kv_heads))
+
+    @torch.no_grad()
+    def hard_topk_blocks(
+        self,
+        Q: torch.Tensor,          # [B, T, HQ, D]
+        K: torch.Tensor,          # [B, T, H,  D]
+        block_size: int,
+        selected_blocks: int,
+        groups: int,
+        is_causal: bool = True,
+        add_local: int = 1,
+        summary: str = "mean",    # keep mean/first/last options
+    ) -> torch.Tensor:
+        """
+        Compute Top-K block indices per token (HARD routing).
+
+        HARD = we use torch.topk(...) to choose discrete blocks.
+        This is the "real" behavior you want at inference.
+
+        Note:
+          topk is not differentiable; that's why training typically uses a
+          soft objective (e.g., KL to dense block-attention) and then you
+          switch to hard topk at inference time.
+
+        add_local:
+          Adds local (current + previous) blocks to stabilize routing,
+          because real sparse attention systems often keep a local window.
+          Example add_local=1 means: union(topk_blocks, {t_block, t_block-1}).
+        """
+        device = Q.device
+        B, T, HQ, D = Q.shape
+        _, Tk, H, Dk = K.shape
+
+        # Basic sanity checks
+        assert Tk == T, "Q and K must have same sequence length"
+        assert Dk == D, "Q and K must have same head dimension"
+        assert HQ % H == 0, "HQ must be divisible by H for GQA"
+        assert groups == (HQ // H), "groups must equal HQ//H"
+
+        BS = block_size
+        num_blocks = (T + BS - 1) // BS  # e.g., T=1024, BS=64 => 16 blocks
+
+        # ------------------------------------------------------------
+        # (1) Build ONE "summary key vector" per block, per kv head.
+        # ------------------------------------------------------------
+        #
+        # We want to go from token-level keys:
+        #   K:   [B, T, H, D]
+        # to block-level summaries:
+        #   Ksum:[B, num_blocks, H, D]
+        #
+        # This is the "compress each block into 1 vector" step.
+        #
+        # Why do this?
+        #   Because routing should be cheap: compare Q to 16 blocks,
+        #   not to 1024 tokens.
+        pad = num_blocks * BS - T
+        if pad > 0:
+            # pad token dimension so we can reshape into exact blocks
+            # F.pad uses (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+            # Here K is [B, T, H, D]; we pad on T dimension: (0,0) for D, (0,0) for H, (0,pad) for T
+            Kp = F.pad(K, (0, 0, 0, 0, 0, pad))
+        else:
+            Kp = K
+
+        # Reshape tokens into blocks:
+        #   [B, Tpad, H, D] -> [B, num_blocks, BS, H, D]
+        # Now BS is "tokens inside each block"
+        Kb = Kp.view(B, num_blocks, BS, H, D)
+
+        # Choose how to summarize each block into ONE vector:
+        if summary == "mean":
+            # Average all tokens in the block -> stable, smooth summary
+            Ksum = Kb.mean(dim=2)         # [B, num_blocks, H, D]
+        elif summary == "last":
+            # Use last token in each block as representative
+            Ksum = Kb[:, :, BS - 1, :, :] # [B, num_blocks, H, D]
+        elif summary == "first":
+            # Use first token in each block
+            Ksum = Kb[:, :, 0, :, :]      # [B, num_blocks, H, D]
+        else:
+            raise ValueError(f"Unknown summary='{summary}'")
+
+        # ------------------------------------------------------------
+        # (2) Pick a representative Q head per KV head (GQA mapping)
+        # ------------------------------------------------------------
+        #
+        # In GQA:
+        #   - Many query heads (HQ)
+        #   - Fewer KV heads (H)
+        #   - groups = HQ // H
+        #
+        # KV head h corresponds to query head (h*groups) as a representative.
+        # (This is a cheap approximation; you could also pool multiple Q heads.)
+        rep_qh = torch.arange(H, device=device) * groups  # [H]
+        Qrep = Q[:, :, rep_qh, :]                         # [B, T, H, D]
+
+        # ------------------------------------------------------------
+        # (3) Project Qrep and Ksum into the learned routing space Dr
+        # ------------------------------------------------------------
+        #
+        # This is the key "learned routing" idea:
+        #   Qr = Qrep @ Wq   (D -> Dr)
+        #   Kr = Ksum @ Wk   (D -> Dr)
+        #
+        # Now comparisons happen in Dr dimensions instead of D dimensions.
+        # Dr is usually much smaller, so routing is cheap.
+        #
+        # Shapes:
+        #   Qr: [B, T, H, Dr]
+        #   Kr: [B, NB, H, Dr]
+        Qr = torch.einsum("bthd,hdr->bthr", Qrep.float(), self.Wq.float())
+        Kr = torch.einsum("bnhd,hdr->bnhr", Ksum.float(), self.Wk.float())
+
+        # ------------------------------------------------------------
+        # (4) Score each token against each block summary (per head)
+        # ------------------------------------------------------------
+        #
+        # scores[b, t, h, n] = dot( Qr[b,t,h,:], Kr[b,n,h,:] )
+        #
+        # Output shape:
+        #   scores: [B, T, H, num_blocks]
+        scores = torch.einsum("bthr,bnhr->bthn", Qr, Kr)
+
+        # Optional head-wise temperature scaling (learned)
+        scale = torch.exp(self.logit_scale).view(1, 1, H, 1).float()
+        scores = scores * scale
+
+        # ------------------------------------------------------------
+        # (5) Apply causal legality at the BLOCK level
+        # ------------------------------------------------------------
+        #
+        # If is_causal=True, token t can only attend to keys k <= t.
+        # At block level, token t can only attend to blocks <= t_block
+        # where t_block = floor(t / BS).
+        #
+        # This prevents selecting "future blocks".
+        if is_causal:
+            t_blk = (torch.arange(T, device=device) // BS).view(1, T, 1, 1)  # [1,T,1,1]
+            blk_ids = torch.arange(num_blocks, device=device).view(1, 1, 1, num_blocks)
+            scores = scores.masked_fill(blk_ids > t_blk, float("-inf"))
+
+        # ------------------------------------------------------------
+        # (6) Pick Top-K blocks (HARD routing)
+        # ------------------------------------------------------------
+        #
+        # This is the discrete sparse pattern selection.
+        # If selected_blocks is small (like 4 or 8), we get real sparsity.
+        Kpick = min(selected_blocks, num_blocks)
+        top = torch.topk(scores, k=Kpick, dim=-1).indices  # [B, T, H, Kpick]
+
+        # ------------------------------------------------------------
+        # (7) Add local blocks (stability / accuracy trick)
+        # ------------------------------------------------------------
+        #
+        # In real systems, purely global Top-K can be unstable.
+        # It's common to always include local blocks near the current token.
+        #
+        # add_local=1 means include:
+        #   t_block and (t_block-1)
+        #
+        # This gives:
+        #   top = union(topk_blocks, local_blocks)
+        if add_local > 0 and is_causal:
+            t_blk = (torch.arange(T, device=device) // BS).view(1, T, 1, 1)
+            locals_ = []
+            for d in range(add_local + 1):
+                locals_.append(torch.clamp(t_blk - d, min=0))
+            local = torch.cat(locals_, dim=-1)     # [1, T, 1, add_local+1]
+            local = local.expand(B, T, H, -1)      # [B, T, H, add_local+1]
+            top = torch.cat([top, local], dim=-1)  # [B, T, H, Kpick + add_local+1]
+
+        # ------------------------------------------------------------
+        # (8) Sort / (cheap) unique / trim to exactly S blocks
+        # ------------------------------------------------------------
+        #
+        # We want stable deterministic ordering + remove duplicates introduced by local union.
+        top_sorted, _ = torch.sort(top, dim=-1)
+
+        # Cheap "unique" for small S: remove adjacent duplicates after sorting.
+        uniq = []
+        for i in range(top_sorted.shape[-1]):
+            if i == 0:
+                uniq.append(top_sorted[..., i:i+1])
+            else:
+                prev = uniq[-1][..., -1:]
+                cur = top_sorted[..., i:i+1]
+                keep = (cur != prev)
+                uniq.append(torch.where(keep, cur, prev))
+
+        uniq = torch.cat(uniq, dim=-1)
+        uniq, _ = torch.sort(uniq, dim=-1)
+
+        # Trim to exactly selected_blocks and return int32 for kernel
+        out = uniq[..., :selected_blocks].contiguous().to(torch.int32)  # [B, T, H, S]
+        return out
+
+
+def dense_block_teacher(Qrep, K, BS, is_causal=True):
+    """
+    Build a "teacher" distribution over blocks using DENSE attention.
+
+    Inputs:
+      Qrep: [B, T, H, D]
+        - Representative queries per KV head (GQA mapping already applied).
+        - For KV head h, we use Q head (h*groups) as the query used for routing.
+
+      K:    [B, T, H, D]
+        - Full keys per KV head.
+
+      BS: block_size (e.g., 64)
+      is_causal: if True, tokens cannot attend to future keys (k > t)
+
+    Output:
+      P_blk: [B, T, H, NB]
+        - For each (b,t,h), a probability distribution across blocks (NB blocks).
+        - This is built by:
+            dense attention probs across tokens -> sum probs within each block.
+    """
+    B, T, H, D = Qrep.shape
+    assert K.shape == (B, T, H, D), f"K must be [B,T,H,D], got {tuple(K.shape)}"
+    NB = (T + BS - 1) // BS
+
+    # ------------------------------------------------------------
+    # (1) Compute dense attention logits over TOKENS:
+    #     logits[b,t,h,k] = dot(Qrep[b,t,h,:], K[b,k,h,:])
+    #
+    # Shape:
+    #   Qrep: [B,T,H,D]
+    #   K:    [B,T,H,D] (but we use token index as 'k')
+    #   logits -> [B,T,H,T]
+    # ------------------------------------------------------------
+    logits = torch.einsum("bthd,bkhd->bthk", Qrep.float(), K.float())
+
+    # ------------------------------------------------------------
+    # (2) Apply causal mask: disallow k > t by setting logits=-inf
+    # ------------------------------------------------------------
+    if is_causal:
+        t_idx = torch.arange(T, device=Qrep.device).view(1, T, 1, 1)  # [1,T,1,1]
+        k_idx = torch.arange(T, device=Qrep.device).view(1, 1, 1, T)  # [1,1,1,T]
+        logits = logits.masked_fill(k_idx > t_idx, float("-inf"))
+
+    # ------------------------------------------------------------
+    # (3) Softmax over token axis k -> dense attention probabilities
+    #     P_tok[b,t,h,k] sums to 1 across k
+    # ------------------------------------------------------------
+    P_tok = torch.softmax(logits, dim=-1)  # [B,T,H,T]
+
+    # ------------------------------------------------------------
+    # (4) Convert token-level probs into block-level probs:
+    #     - reshape token axis T into NB blocks of size BS
+    #     - sum probs inside each block
+    #
+    # If T not divisible by BS, pad on token axis.
+    # ------------------------------------------------------------
+    pad = NB * BS - T
+    if pad > 0:
+        P_tok = F.pad(P_tok, (0, pad))  # pad last dim (token k)
+
+    # After pad: token axis length = NB*BS
+    # Reshape: [B,T,H,NB,BS], then sum over BS -> [B,T,H,NB]
+    P_blk = P_tok.view(B, T, H, NB, BS).sum(dim=-1)
+
+    # Normalize to be safe (numerical stability)
+    P_blk = P_blk / (P_blk.sum(dim=-1, keepdim=True) + 1e-9)
+    return P_blk
+
+
+def router_logits_over_blocks(router, Q, K, BS, groups, summary="mean", is_causal=True):
+    """
+    Compute router *logits over blocks* (NO topk here).
+
+    This is the differentiable part used for training:
+      - we produce a distribution over blocks via softmax(logits)
+      - we match it to the dense teacher distribution
+
+    Inputs:
+      Q: [B,T,HQ,D]
+      K: [B,T,H,D]
+      BS: block_size
+      groups: HQ//H (e.g., 4)
+      summary: how to summarize K inside each block ("mean"/"first"/"last")
+
+    Outputs:
+      logits_blk: [B,T,H,NB]
+      Qrep:       [B,T,H,D]  (representative queries per KV head, used for teacher)
+    """
+    device = Q.device
+    B, T, HQ, Dq = Q.shape
+    Bk, Tk, H, Dk = K.shape
+    assert Bk == B and Tk == T, "Q and K must share [B,T]"
+    assert Dk == Dq, f"Q and K last dim must match; got Q={Dq}, K={Dk}"
+    assert HQ % H == 0, "HQ must be divisible by H"
+    assert groups == (HQ // H), "groups must equal HQ//H"
+
+    NB = (T + BS - 1) // BS
+
+    # ------------------------------------------------------------
+    # (1) Summarize keys per block: Ksum [B,NB,H,D]
+    # ------------------------------------------------------------
+    pad = NB * BS - T
+    if pad > 0:
+        Kp = F.pad(K, (0, 0, 0, 0, 0, pad))  # pad token dimension
+    else:
+        Kp = K
+
+    # Kb: [B,NB,BS,H,D]
+    Kb = Kp.view(B, NB, BS, H, Dk)
+
+    if summary == "mean":
+        Ksum = Kb.mean(dim=2)          # [B,NB,H,D]
+    elif summary == "first":
+        Ksum = Kb[:, :, 0, :, :]       # [B,NB,H,D]
+    elif summary == "last":
+        Ksum = Kb[:, :, BS - 1, :, :]  # [B,NB,H,D]
+    else:
+        raise ValueError(summary)
+
+    # ------------------------------------------------------------
+    # (2) GQA mapping: select one representative Q head per KV head
+    #
+    # For KV head h, representative Q head index = h*groups
+    # rep_qh: [H]
+    # Qrep:  [B,T,H,D]
+    # ------------------------------------------------------------
+    rep_qh = torch.arange(H, device=device) * groups
+    Qrep = Q[:, :, rep_qh, :]  # [B,T,H,D]
+
+    # ------------------------------------------------------------
+    # (3) Learned projection into routing space Dr
+    #
+    # router.Wq: [H,D,Dr]
+    # router.Wk: [H,D,Dr]
+    #
+    # Qr: [B,T,H,Dr]
+    # Kr: [B,NB,H,Dr]
+    # ------------------------------------------------------------
+    # IMPORTANT: If your Q/K last dimension is not what you expected,
+    # this is where einsum will throw. Our asserts above catch it early.
+    Qr = torch.einsum("bthd,hdr->bthr", Qrep.float(), router.Wq.float())
+    Kr = torch.einsum("bnhd,hdr->bnhr", Ksum.float(), router.Wk.float())
+
+    # ------------------------------------------------------------
+    # (4) Similarity logits over blocks:
+    # logits[b,t,h,n] = dot(Qr[b,t,h,:], Kr[b,n,h,:])
+    # Shape: [B,T,H,NB]
+    # ------------------------------------------------------------
+    logits = torch.einsum("bthr,bnhr->bthn", Qr, Kr)
+
+    # Optional learned head-wise scaling (temperature)
+    logits = logits * torch.exp(router.logit_scale).view(1, 1, H, 1).float()
+
+    # ------------------------------------------------------------
+    # (5) Causal mask at BLOCK level
+    # Disallow blocks > t_block (future blocks)
+    # ------------------------------------------------------------
+    if is_causal:
+        t_blk = (torch.arange(T, device=device) // BS).view(1, T, 1, 1)
+        blk = torch.arange(NB, device=device).view(1, 1, 1, NB)
+        logits = logits.masked_fill(blk > t_blk, float("-inf"))
+
+    return logits, Qrep
+
+
+def train_router(router, Q, K, *, BS=64, groups=4, steps=400, lr=3e-3, summary="mean"):
+    """
+    Train router parameters (Wq, Wk, logit_scale) to match dense teacher block distribution.
+
+    Training objective:
+      KL( P_teacher_blocks || P_router_blocks )
+
+    Why KL?
+      - We want the router to assign high probability to blocks that dense attention
+        actually uses (sum of attention mass in that block).
+      - This yields a "learned routing policy" that is accuracy-oriented.
+
+    Notes:
+      - This trains only the router. Your TileLang kernel remains unchanged.
+      - This is 'accurate': after training, sparse output should approximate dense output,
+        so you might NOT see dramatic output differences—what changes is compute.
+    """
+    router.train()
+    opt = torch.optim.AdamW(router.parameters(), lr=lr, weight_decay=1e-4)
+
+    for step in range(steps):
+        opt.zero_grad(set_to_none=True)
+
+        # Router logits across blocks (differentiable)
+        logits_blk, Qrep = router_logits_over_blocks(
+            router, Q, K, BS, groups, summary=summary, is_causal=True
+        )
+        P_router = torch.softmax(logits_blk, dim=-1)  # [B,T,H,NB]
+
+        # Dense teacher distribution (no grad)
+        with torch.no_grad():
+            P_teacher = dense_block_teacher(Qrep, K, BS, is_causal=True)  # [B,T,H,NB]
+
+        # KL(P_teacher || P_router) over blocks, averaged
+        # KL = sum_i P_teacher[i] * (log P_teacher[i] - log P_router[i])
+        loss = torch.sum(
+            P_teacher * (torch.log(P_teacher + 1e-9) - torch.log(P_router + 1e-9)),
+            dim=-1
+        ).mean()
+
+        loss.backward()
+        opt.step()
+
+        # Basic logging: loss + average entropy of router distribution
+        if step % 50 == 0 or step == steps - 1:
+            with torch.no_grad():
+                entropy = (-P_router * torch.log(P_router + 1e-9)).sum(dim=-1).mean().item()
+            print(f"step {step:4d} | loss {loss.item():.6f} | router entropy {entropy:.3f}")
+
+    router.eval()
+    
 # ==================================================================================================
 # 1) CONTENT-BASED TOP-K BLOCK INDEXER  (Option 2)
 # ==================================================================================================
@@ -544,45 +1021,57 @@ def native_sparse_attention(batch, heads, seq_len, dim, is_causal, scale=None, b
     return native_sparse_attention
 
 def plot_block_selection_heatmap(
-    block_indices: torch.Tensor,  # [B, T, H, S] int32
+    block_indices: torch.Tensor,
     block_size: int,
     b: int = 0,
     h: int = 0,
     start_t: int = 0,
     T_show: int = 256,
-    title: str = "Block selection heatmap (token × block)",
+    title: str = "Block selection heatmap"
 ):
     """
-    Visualize selection as a binary heatmap:
-      y-axis: token index t
-      x-axis: block id
-      value: 1 if block selected for token, else 0
-
-    Works great for showing late-sequence behavior:
-      start_t = T - 256, T_show = 256
+    Visualize block selection as a binary heatmap:
+      rows = tokens
+      cols = blocks
+      value=1 if block selected for that token
     """
-    assert block_indices.ndim == 4, "Expected [B, T, H, S]"
-    B, T, H, S = block_indices.shape
-    end_t = min(start_t + T_show, T)
-    idx = block_indices[b, start_t:end_t, h]  # [T_show, S]
+
+    # ---- SOURCE OF TRUTH: actual tensor length ----
+    # block_indices: [B, T, H_kv, S]
+    T = block_indices.shape[1]
+    S = block_indices.shape[-1]
+
+    # ---- Clamp requested window to valid [0, T] ----
+    start_t = max(0, int(start_t))
+    end_t = min(T, start_t + int(T_show))
+
+    # If the window is empty, print something useful and return
+    if end_t <= start_t:
+        print(
+            f"[heatmap] Empty window: start_t={start_t}, end_t={end_t}, "
+            f"T={T}. Try smaller start_t or smaller T_show."
+        )
+        return
+
+    # Slice: [T_window, S]
+    idx = block_indices[b, start_t:end_t, h]
 
     num_blocks = (T + block_size - 1) // block_size
 
     # Build binary matrix M[t, block] = 1 if selected
     M = torch.zeros((end_t - start_t, num_blocks), device="cpu", dtype=torch.float32)
 
-    # Fill selected blocks
-    # (We clamp to valid range just in case)
-    blk = idx.to("cpu").clamp(min=0, max=num_blocks - 1)  # [T_show, S]
-    t_ids = torch.arange(end_t - start_t).unsqueeze(1).repeat(1, S)  # [T_show, S]
-    M[t_ids, blk] = 1.0
+    # Fill selected blocks (clamp to valid range just in case)
+    blk = idx.to("cpu").clamp(min=0, max=num_blocks - 1)  # [T_window, S]
+    for t in range(blk.shape[0]):
+        M[t, blk[t].tolist()] = 1.0
 
-    plt.figure(figsize=(12, 6))
-    plt.imshow(M.numpy(), aspect="auto", interpolation="nearest")  # default colormap
-    plt.xlabel("Block ID")
-    plt.ylabel("Token t (windowed)")
-    plt.title(f"{title} | b={b}, kv_head={h}, t=[{start_t}..{end_t-1}], blocks={num_blocks}, S={S}")
-    plt.colorbar(label="selected (1) / not selected (0)")
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.imshow(M, aspect="auto", interpolation="nearest")
+    plt.title(f"{title} | b={b}, kv_head={h}, t=[{start_t},{end_t}) | S={S}, blocks={num_blocks}")
+    plt.xlabel("Block id")
+    plt.ylabel("Token t")
     plt.show()
 
 # ==================================================================================================
@@ -631,16 +1120,60 @@ def main():
     K = torch.randn((B, SEQ_LEN, H, D), dtype=dtype, device="cuda")
     V = torch.randn((B, SEQ_LEN, H, D), dtype=dtype, device="cuda")
 
+    # router = MiniDSARouter(dim=D, dr=16, kv_heads=H).to("cuda")
+    SEQ_LEN=1024; BS=64; H=8; HQ=32; D=64; groups=HQ//H  # 4
+    print("Q shape:", tuple(Q.shape))
+    print("K shape:", tuple(K.shape))
+    assert Q.shape[-1] == K.shape[-1]
+
+    # Source of truth: tensors
+    H_actual  = K.shape[2]
+    HQ_actual = Q.shape[2]
+    D_actual  = Q.shape[-1]
+    
+    assert HQ_actual % H_actual == 0
+    groups = HQ_actual // H_actual
+    
+    print("Q:", tuple(Q.shape), "K:", tuple(K.shape))
+    print("H_actual:", H_actual, "HQ_actual:", HQ_actual, "groups:", groups, "D_actual:", D_actual)
+    
+    # IMPORTANT: kv_heads must equal H_actual (not some stale H variable)
+    router = MiniDSARouter(dim=D_actual, dr=16, kv_heads=H_actual).to("cuda")
+    
+    train_router(router, Q, K, BS=BS, groups=groups, steps=400, lr=3e-3, summary="mean")
+    
+    # router = MiniDSARouter(dim=D, dr=16, kv_heads=H).to("cuda")
+    # train_router(router, Q, K, BS=BS, groups=groups, steps=400, lr=3e-3, summary="mean")
+
+    block_indices = router.hard_topk_blocks(
+        Q, K, 
+        block_size=BS, 
+        selected_blocks=8, 
+        groups=groups, 
+        is_causal=True, 
+        add_local=1)
+    out = kernel(Q, K, V, block_indices)
+    # after you create Q and K:
+    # block_indices = router.hard_topk_blocks(
+    #     Q=Q, K=K,
+    #     block_size=block_size,
+    #     selected_blocks=S,
+    #     groups=HQ // H,
+    #     is_causal=True,
+    #     add_local=1,
+    # )
+
+    # This one is not learned
     # Build content-based Top-K block indices
-    block_indices = build_block_indices_topk(
-        Q=Q,
-        K=K,
-        block_size=block_size,
-        selected_blocks=S,
-        groups=groups,
-        summary="mean",
-        add_local=2,  # always include last 2 blocks
-    )
+    # block_indices = build_block_indices_topk(
+    #     Q=Q,
+    #     K=K,
+    #     block_size=block_size,
+    #     selected_blocks=S,
+    #     groups=groups,
+    #     summary="mean",
+    #     add_local=2,  # always include last 2 blocks
+    # )
 
     # Show selected blocks for a few tokens
     b, h = 0, 0
@@ -651,12 +1184,16 @@ def main():
     # Visualize selection for first 128 tokens
     ascii_blockmap(block_indices, BS=block_size, T_show=128, b=0, h=0)
 
+    T = block_indices.shape[1]
+    start_t = max(0, T - 256)
+    
     plot_block_selection_heatmap(
         block_indices,
         block_size=block_size,
         b=0, h=0,
-        start_t=SEQ_LEN - 256,
-        T_show=256,
+        start_t=start_t,
+        T_show=min(256, T),
+        title="Last tokens: selected blocks"
     )
 
     # Warmup runs (helps stabilize performance measurement)
