@@ -44,21 +44,7 @@ $$ \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right
 Imagine we have 3 tokens. We compute similarity between *every* pair.
 
 $$
-\begin{bmatrix}
-q_1 \\
-q_2 \\
-q_3
-\end{bmatrix}
-\cdot
-\begin{bmatrix}
-k_1 & k_2 & k_3
-\end{bmatrix}
-=
-\begin{bmatrix}
-q_1 \cdot k_1 & q_1 \cdot k_2 & q_1 \cdot k_3 \\
-q_2 \cdot k_1 & q_2 \cdot k_2 & q_2 \cdot k_3 \\
-q_3 \cdot k_1 & q_3 \cdot k_2 & q_3 \cdot k_3
-\end{bmatrix}
+\begin{bmatrix} q_1 \\ q_2 \\ q_3 \end{bmatrix} \cdot \begin{bmatrix} k_1 & k_2 & k_3 \end{bmatrix} = \begin{bmatrix} q_1 k_1 & q_1 k_2 & q_1 k_3 \\ q_2 k_1 & q_2 k_2 & q_2 k_3 \\ q_3 k_1 & q_3 k_2 & q_3 k_3 \end{bmatrix}
 $$
 
 This $T \times T$ matrix is the **Attention Map**. Each cell $(i, j)$ tells us: "How much should token $i$ pay attention to token $j$?"
@@ -69,14 +55,20 @@ The $T \times T$ attention matrix is the source of the problem.
 - **Compute Cost**: Calculating $QK^T$ requires $O(T^2 \cdot D)$ floating point operations (FLOPs).
 - **Memory Cost**: Storing the attention matrix requires $O(T^2)$ memory.
 
-```mermaid
-kp
-plot
-    title "Compute Cost Scaling"
-    xAxis "Sequence Length (T)"
-    yAxis "Operations"
-    line [0, 1000, 2000, 4000, 8000]
-    line [0, 1000000, 4000000, 16000000, 64000000]
+```
+      ^ Operations
+      |
+      |                                   / (Quadratic: T^2)
+      |                                 _/
+      |                               _/
+      |                             _/
+      |                           _/
+      |                         _/
+      |                       _/
+      |                     _/
+      |                   _/
+      |                 _/
+      |_______________/______________________> Sequence Length (T)
 ```
 *(Note: Imagine a steeply rising parabola here. Doubling sequence length quadruples the cost.)*
 

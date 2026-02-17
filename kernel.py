@@ -971,6 +971,11 @@ class CompressedAttention(nn.Module):
         # [B, T, H, D] -> [B, T, H*D] -> [B, H*D, T]
         X_flat = X.reshape(B, T_len, H * D).transpose(1, 2)  # [B, H*D, T]
 
+        # Step 1.5: Cast to float32 to match Conv1d weight dtype
+        # Input Q/K/V are often fp16 for GPU efficiency, but nn.Conv1d weights
+        # default to float32. PyTorch requires input and weight to share dtype.
+        X_flat = X_flat.float()
+
         # Step 2: Causal padding
         # We pad on the LEFT with (kernel_size - 1) zeros
         # This ensures each output position only depends on past + current tokens
