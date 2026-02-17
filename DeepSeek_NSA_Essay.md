@@ -200,121 +200,136 @@ So a tensor `[B, T, H, D]` simply means: **"For every person (B), look at every 
 
 ## 4.1 The Compression Layer (`CompressedAttention`)
 
+### The Concept: The Skimmer
+Remember, the **Skimmer** turns 4 books into 1 summary.
+
+### The Code ([Line 1365](file:///c:/Users/Administrator/Desktop/GitHub/MLSys2026_SA/kernel.py#L1365))
 ```python
-class CompressedAttention(nn.Module):
-    def __init__(self, ... compression_ratio=4):
-        # We use a Convolution to compress the text.
-        # stride=4 means we jump 4 steps at a time.
-        self.conv_k = nn.Conv1d(..., stride=compression_ratio, ...)
+self.compressed_attn = CompressedAttention(
+    dim=dim,
+    kv_heads=kv_heads,
+    compression_ratio=compression_ratio, # e.g., 4
+)
 ```
 
-**What is `Conv1d`?**
-Think of it as a weighted average. It looks at 4 adjacent tokens, multiplies them by some learned weights, and sums them up into 1 token.
-- Input: `[He] [went] [to] [the]`
-- Output: `[Concept_Going]`
-
-The code then runs standard attention on these compressed tokens. Because there are 4x fewer tokens, it is very fast.
+Inside `CompressedAttention`, we see the magic mechanism:
+```python
+# [Line 926] Strided Convolution: The mathematical way to "summarize"
+self.conv_k = nn.Conv1d(
+    in_channels=dim * kv_heads,
+    out_channels=dim * kv_heads,
+    kernel_size=kernel_size,
+    stride=compression_ratio,  # <--- This is the key! Skips tokens.
+    groups=dim * kv_heads
+)
+```
+**Translation:**
+*   `stride=4`: Walk through the library 4 steps at a time.
+*   `groups=...`: Don't mix up the topics (channels). Summarize history books into history summaries, and science books into science summaries.
 
 ## 4.2 The "Detective" Indexer (`build_block_indices_from_compressed`)
 
-This function bridges the gap between the Skimmer and the Detective.
+### The Concept: The Selector
+The Detective asks the Skimmer: *"Where should I look?"*
 
+### The Code ([Line 1456](file:///c:/Users/Administrator/Desktop/GitHub/MLSys2026_SA/kernel.py#L1456))
 ```python
-def build_block_indices_from_compressed(attn_weights_compressed, ...):
-    # 1. Take the "blurry" attention map from the Skimmer (Compressed Branch).
-    # 2. Map it back to original block numbers.
-    #    "Skimmer liked compressed token #10? That corresponds to original blocks #40-43."
-    
-    # 3. Add up all the scores for each block.
-    block_scores.scatter_add_(...)
-
-    # 4. Pick the winners (Top-K)
-    top_block_indices = torch.topk(block_scores, k=selected_blocks, ...)
-    return top_block_indices
+block_indices = build_block_indices_from_compressed(
+    attn_weights_compressed=attn_weights_c, # Skimmer's report
+    ...
+)
 ```
 
-**Crucial Detail:** `add_local`.
-The code artificially adds a huge score to the last 2 blocks.
+Inside the utility function:
 ```python
-if add_local:
-    # Force the last few blocks to always be selected
-    block_scores.scatter_add_(..., boost=1e9)
+# [Line 1247] Add up scores from the Skimmer
+block_scores.scatter_add_(
+    dim=-1,
+    index=block_indices_repeated,
+    src=attn_weights_upSampled
+)
+
+# [Line 1261] The "Secretary" Check
+# Force the last few blocks to always be selected
+if add_local > 0:
+    block_scores.scatter_add_(..., src=torch.full(..., 1e9))
+
+# [Line 1290] Pick the winners (Top-K)
+top_block_indices = torch.topk(block_scores, k=selected_blocks, dim=-1).indices
 ```
-This ensures the Detective *always* checks the most recent context, just in case the Skimmer missed it.
+**Translation:**
+1.  `scatter_add`: If the summary for Block 5 was interesting, give points to Block 5.
+2.  `1e9`: Give infinite points to the most recent blocks (so the Secretary is happy).
+3.  `topk`: Pick the 16 blocks with the highest points.
 
-## 4.3 The TileLang Kernel (The Engine Room)
+## 4.3 The Memory-Efficient Engine (`NativeSparseAttention`)
 
-This is the hardest part of the code (`native_sparse_attention`). It is written in **TileLang**, which is a way to write CUDA (GPU code) using Python syntax.
+### The Concept: The Investigation
+Now we actually read the books. But we do it cleverly.
 
-### The "Tiling" Concept
-GPUs hate random access. They like reading big continuous rectangles of data.
-Imagine the Attention Matrix is a giant tiled floor.
-- **Dense Attention:** We have to mop the *entire* floor.
-- **Block Sparse Attention:** We only mop the dirty tiles (the Selected Blocks).
-
-### The Kernel Loop
+### The Code ([Line 1468](file:///c:/Users/Administrator/Desktop/GitHub/MLSys2026_SA/kernel.py#L1468))
 ```python
-@tilelang.jit
-def kernel(Q, K, V, block_indices, ...):
-    # Each GPU thread block handles a chunk of Queries (Q_tile)
-    
-    # Loop over the *Selected Blocks* only
-    # (Not all blocks! That's the speedup!)
-    for i in range(selected_blocks):
-        
-        # 1. Look up *which* block to grab
-        block_id = block_indices[current_query, i]
-        
-        # 2. Load that specific Key/Value block from memory
-        K_tile = load(K[block_id])
-        V_tile = load(V[block_id])
-        
-        # 3. Compute score = Q dot K
-        scores = Q_tile @ K_tile.T
-        
-        # 4. Only keep relevant scores (Softmax)
-        scores = softmax(scores)
-        
-        # 5. Multiply by Value
-        output += scores @ V_tile
+if kernel_fn is not None:
+    # Use the fast, specialist Detective (TileLang Kernel)
+    O_selected = kernel_fn(Q, K, V, block_indices)
+else:
+    # Use the slow, meticulous Detective (PyTorch Fallback)
+    O_selected = self._selected_attention_fallback(...)
 ```
-
-This loop is where the magic happens. By only looping `range(selected_blocks)` instead of `range(total_blocks)`, we turn an impossible computation into a fast one.
+**Translation:**
+*   `block_indices`: The list of specific shelves to check.
+*   `kernel_fn`: A specialized robot that zips directly to those shelves and ignores the rest of the library.
 
 ## 4.4 The Sliding Window Branch (`SlidingWindowAttention`)
 
-This is the simplest branch. It uses a **Mask**.
-A mask is like a stencil you put over a piece of paper. You can only spray paint (attend) where the holes are.
+### The Concept: The Secretary
+Always checking the immediate past.
 
+### The Code ([Line 1484](file:///c:/Users/Administrator/Desktop/GitHub/MLSys2026_SA/kernel.py#L1484))
 ```python
-# Create a mask where everything older than `window_size` is ignored.
-window_mask = k_idx < (t_idx - WindowSize + 1)
+O_window = self.window_attn(Q, K, V, ...)
+```
 
-# Set the ignored spots to negative infinity
+Inside `SlidingWindowAttention`:
+```python
+# [Line 1146] The "Stencil" (Mask)
+window_mask = k_idx < (t_idx - self.window_size + 1)
+
+# [Line 1150] Spray paint over the ignored areas
 scores.masked_fill(window_mask, float("-inf"))
 ```
-When `softmax` sees negative infinity, it turns it into exactly **Zero**. So those tokens get 0% attention.
+**Translation:**
+*   `masked_fill(-inf)`: Effectively deletes these books from existence for the purpose of this calculation.
 
-## 4.5 The Output Fusion (`NativeSparseAttention.forward`)
+## 4.5 The Output Fusion: The Boss (`NativeSparseAttention.forward`)
 
-Finally, we mix the ingredients.
+### The Concept: The Decision
+The Boss decides who to trust for each word.
 
+### The Code ([Line 1496](file:///c:/Users/Administrator/Desktop/GitHub/MLSys2026_SA/kernel.py#L1496))
 ```python
-# 1. Get the gates (How much to trust each reader?)
-#    (These are learned "knobs" the model turns automatically)
-g_slc = sigmoid(gate_slc(Q))
-g_swa = sigmoid(gate_swa(Q))
+# The Boss asks: "Given this query Q, how much do I trust the Detective?"
+g_slc = torch.sigmoid(self.gate_slc(Q))
 
-# 2. Calculate the "leftover" trust for the Skimmer
+# The Boss asks: "How much do I trust the Secretary?"
+g_swa = torch.sigmoid(self.gate_swa(Q))
+
+# The leftover trust goes to the Skimmer
 g_cmp = 1.0 - g_slc - g_swa
-
-# 3. Mix them!
-Final_Output = (g_cmp * O_compressed) + 
-               (g_slc * O_selected) + 
-               (g_swa * O_window)
 ```
 
-The result `Final_Output` is a tensor that has the same shape as the input Query, but now filled with rich context from the entire document, expertly retrieved by our team of three readers.
+And finally, the synthesis:
+```python
+# [Line 1518] The Final Answer
+O_final = (
+    g_cmp * O_compressed   # Skimmer's contribution
+    + g_slc * O_selected   # Detective's contribution
+    + g_swa * O_window     # Secretary's contribution
+)
+```
+**Translation:**
+*   If the Boss is 90% sure about the Detective (`g_slc=0.9`), the Detective's finding dominates the answer.
+*   The math ensures the total trust sums to exactly 100% (or less, if the Boss is uncertain about everything).
 
 ---
 
