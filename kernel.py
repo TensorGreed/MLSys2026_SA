@@ -48,6 +48,7 @@ import torch.nn.functional as F
 from typing import Optional
 
 
+# [BACKUP] Legacy router model (replaced by NativeSparseAttention)
 class MiniDSARouter(nn.Module):
     """
     Mini-DSA Router (Learned Projection + Learned Routing)
@@ -305,6 +306,7 @@ class MiniDSARouter(nn.Module):
         return out
 
 
+# [BACKUP] Used for training MiniDSARouter (Teacher distribution)
 def dense_block_teacher(Qrep, K, BS, is_causal=True):
     """
     Build a "teacher" distribution over blocks using DENSE attention.
@@ -375,6 +377,7 @@ def dense_block_teacher(Qrep, K, BS, is_causal=True):
     return P_blk
 
 
+# [BACKUP] Helper for MiniDSARouter
 def router_logits_over_blocks(router, Q, K, BS, groups, summary="mean", is_causal=True):
     """
     Compute router *logits over blocks* (NO topk here).
@@ -471,6 +474,7 @@ def router_logits_over_blocks(router, Q, K, BS, groups, summary="mean", is_causa
     return logits, Qrep
 
 
+# [BACKUP] Training loop for MiniDSARouter (distribution matching)
 def train_router(router, Q, K, *, BS=64, groups=4, steps=400, lr=3e-3, summary="mean"):
     """
     Train router parameters (Wq, Wk, logit_scale) to match dense teacher block distribution.
@@ -525,6 +529,7 @@ def train_router(router, Q, K, *, BS=64, groups=4, steps=400, lr=3e-3, summary="
 # -----------------------------------------------------------------------------
 # Helper: scaled dot product attention, written explicitly for clarity
 # -----------------------------------------------------------------------------
+# [DEBUG/VERIFICATION] Naive O(T^2) dense attention for output verification
 def dense_attention_output(Qrep, K, V, is_causal=True, scale=None):
     """
     Compute FULL dense attention output for Qrep against K/V.
@@ -571,6 +576,7 @@ def dense_attention_output(Qrep, K, V, is_causal=True, scale=None):
 # We do dense attention, BUT we add a block prior from the router.
 # That makes the output depend on router parameters (Wq/Wk/logit_scale).
 # -----------------------------------------------------------------------------
+# [BACKUP] Student model for router training (differentiable sparse approximation)
 def block_gated_attention_output(Qrep, K, V, P_blocks, block_size, is_causal=True, scale=None, eps=1e-9):
     """
     Compute attention output where routing selects blocks SOFTLY (differentiable).
@@ -658,6 +664,7 @@ def block_gated_attention_output(Qrep, K, V, P_blocks, block_size, is_causal=Tru
 # -----------------------------------------------------------------------------
 # Entropy regularization on router distributions
 # -----------------------------------------------------------------------------
+# [BACKUP] Training loss helper
 def router_entropy(P_blocks, eps=1e-9):
     """
     Compute mean entropy of router distribution over blocks.
@@ -679,6 +686,7 @@ def router_entropy(P_blocks, eps=1e-9):
 # -----------------------------------------------------------------------------
 # JOINT training: match dense output (teacher) and encourage sparse routing
 # -----------------------------------------------------------------------------
+# [BACKUP] Joint training loop for MiniDSARouter (output distillation + distribution matching)
 def train_router_joint(
     router,
     Q, K, V,
@@ -1642,6 +1650,7 @@ class NativeSparseAttention(nn.Module):
 # ==================================================================================================
 
 @torch.no_grad()
+# [BACKUP] Legacy indexer (router-based top-k selection)
 def build_block_indices_topk(
     Q: torch.Tensor,         # [B, T, HQ, D]
     K: torch.Tensor,         # [B, T, H,  D]
