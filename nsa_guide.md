@@ -116,6 +116,19 @@ Look back at the output of the first `einsum`: `[b, t, h, k]`.
 If `T = 100,000`, the grid is $100,000 \times 100,000$. 
 The math required squares dynamically. This is the **Quadratic Bottleneck of Dense Attention**. You simply cannot do this on modern GPU hardware without running out of RAM in milliseconds.
 
+### Visualizing the Dense Attention Matrix
+Imagine a 5-token sequence. The math creates a $5 \times 5$ grid. The causal mask (the `-inf` values) zeroes out the upper right triangle.
+
+```text
+       Key 1   Key 2   Key 3   Key 4   Key 5
+Q 1  [ 100%      0       0       0       0   ]  <- Looks only at itself
+Q 2  [  40%     60%      0       0       0   ]  <- Looks at past
+Q 3  [  10%     20%     70%      0       0   ]
+Q 4  [  30%      5%     10%     55%      0   ]
+Q 5  [   5%     20%     15%     10%     50%  ]  <- Looks at everything
+```
+When this box grows from $5 \times 5$ to $100,000 \times 100,000$, the memory blows up.
+
 ---
 
 ## 4. The Three Departments of DeepSeek's NSA
@@ -140,6 +153,47 @@ Imagine the AI is a CEO assigned to read a 10,000-page legal document. Doing it 
    - *Cost:* Highly optimized. You are only doing extreme math on 1% of the document! 
 
 **(Pause for recap)**: Dense Attention processes 100% of the document at 100% resolution. NSA processes 1% of the document at 100% resolution, 99% of the document at 1% resolution, and 100% of the immediate 2 paragraphs.
+
+### The NSA Architecture Diagram
+Here is how the data flows from a single Query token through the three modules:
+
+```mermaid
+graph TD
+    Q[Query Token]
+    K[All Past Keys]
+    V[All Past Values]
+
+    Q --> SWA[Sliding Window Attention]
+    K -- "Take Last W" --> SWA
+    V -- "Take Last W" --> SWA
+    SWA --> O_swa[O_window]
+
+    K -- "Compress (Conv1d)" --> Kc[Compressed Keys Kc]
+    V -- "Compress (Conv1d)" --> Vc[Compressed Values Vc]
+    Q --> CA[Compressed Attention]
+    Kc --> CA
+    Vc --> CA
+    CA --> O_cmp[O_compressed]
+    CA -. "Attention Weights" .-> IDX{Indexer}
+
+    IDX -- "Top K Block IDs" --> SA[Selected Attention]
+    Q --> SA
+    K -- "Extract Exact Blocks" --> SA
+    V -- "Extract Exact Blocks" --> SA
+    SA --> O_slc[O_selected]
+
+    Q -. "Linear & Sigmoid" .-> Gate((Learned Gate))
+    
+    O_swa --> Mix
+    O_cmp --> Mix
+    O_slc --> Mix
+    Gate --> Mix[Weighted Sum Mixing]
+    
+    Mix --> Final[Final NSA Output]
+
+    style Gate fill:#f9f,stroke:#333,stroke-width:2px
+    style Mix fill:#bbf,stroke:#333,stroke-width:2px
+```
 
 Let's dive into the code for each.
 
@@ -180,6 +234,14 @@ In `CompressedKVUpdate`, we use an incredibly standard ML feature called a 1D Co
 ```python
 # Pool `c` tokens into 1 via simple average or trainable linear projection
 k_c = k_chunk.mean(dim=2) # simplified average pooling
+```
+
+Visually, compressing a block of length $C=4$ looks like this:
+```text
+Raw Tokens:   [ T1 ] [ T2 ] [ T3 ] [ T4 ]   [ T5 ] [ T6 ] [ T7 ] [ T8 ]
+                   \   |   /   /                 \   |   /   /
+Average:            \  |  /   /                   \  |  /   /
+Compressed:         [ Block 1 ]                     [ Block 2 ]
 ```
 
 We now have two new matrices: `K_c` (Compressed Keys) and `V_c` (Compressed Values).
