@@ -155,68 +155,100 @@ Imagine the AI is a CEO assigned to read a 10,000-page legal document. Doing it 
 **(Pause for recap)**: Dense Attention processes 100% of the document at 100% resolution. NSA processes 1% of the document at 100% resolution, 99% of the document at 1% resolution, and 100% of the immediate 2 paragraphs.
 
 ### The NSA Architecture Diagram
-Here is how the data flows from a single Query token through the three modules:
+Here is how the data flows from a single Query token through the three modules. I've added the exact PyTorch class names and variables from `kernel.py` so you can trace the logic directly!
 
 ```mermaid
 graph TD
-    Q[Query Token]
-    K[All Past Keys]
-    V[All Past Values]
+    Q[Q: Query Token]
+    K[K_ctx: All Past Keys]
+    V[V_ctx: All Past Values]
 
-    Q --> SWA[Sliding Window Attention]
+    %% Sliding Window Branch
+    Q --> SWA[SlidingWindowAttention]
     K -- "Take Last W" --> SWA
     V -- "Take Last W" --> SWA
     SWA --> O_swa[O_window]
 
-    K -- "Compress (Conv1d)" --> Kc[Compressed Keys Kc]
-    V -- "Compress (Conv1d)" --> Vc[Compressed Values Vc]
-    Q --> CA[Compressed Attention]
+    %% Compressed Branch
+    K -- "Conv1d" --> Kc[K_c: Compressed Keys]
+    V -- "Conv1d" --> Vc[V_c: Compressed Values]
+    Q --> CA[CompressedAttention]
     Kc --> CA
     Vc --> CA
     CA --> O_cmp[O_compressed]
-    CA -. "Attention Weights" .-> IDX{Indexer}
+    CA -. "attn_weights_c" .-> IDX{Indexer: build_block_indices}
 
-    IDX -- "Top K Block IDs" --> SA[Selected Attention]
+    %% Selected Branch
+    IDX -- "block_indices" --> SA[kernel_fn OR _selected_fallback]
     Q --> SA
     K -- "Extract Exact Blocks" --> SA
     V -- "Extract Exact Blocks" --> SA
     SA --> O_slc[O_selected]
 
-    Q -. "Linear & Sigmoid" .-> Gate((Learned Gate))
+    %% Gating
+    Q -. "g_proj(Q)" .-> Gate((Learned Gate: g_cmp, g_slc, g_swa))
     
+    %% Mixing
     O_swa --> Mix
     O_cmp --> Mix
     O_slc --> Mix
     Gate --> Mix[Weighted Sum Mixing]
     
-    Mix --> Final[Final NSA Output]
+    Mix --> Final[O_final]
 
+    %% Styling
     style Gate fill:#f9f,stroke:#333,stroke-width:2px
     style Mix fill:#bbf,stroke:#333,stroke-width:2px
+    style SWA fill:#e1f5fe,stroke:#0277bd,stroke-width:1px
+    style CA fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
+    style SA fill:#fff3e0,stroke:#ef6c00,stroke-width:1px
+    style IDX fill:#f3e5f5,stroke:#6a1b9a,stroke-width:1px
 ```
 
-Let's dive into the code for each.
+#### Code Correlation Cheat Sheet
+If you open up `NativeSparseAttention.forward()` in `kernel.py`, you will see this exact flowchart executing step-by-step:
+*   **`SlidingWindowAttention`**: Computes `O_window`.
+*   **`CompressedAttention`**: Computes `O_compressed`, and crucially exports `attn_weights_c`.
+*   **`Indexer`**: `build_block_indices_from_compressed()` uses `attn_weights_c` to figure out which high-res memory blocks to keep.
+*   **`Selected Attention`**: Either fires the ultra-fast TileLang GPU `kernel_fn`, or runs the safe PyTorch `_selected_attention_fallback` using the `block_indices` to generate `O_selected`.
+*   **`Gate`**: Uses `self.g_proj(Q.float())` to squish the Query into percentages, creating `g_cmp`, `g_slc`, and `g_swa`.
+*   **`O_final`**: The giant `+` equation at the very end of the `forward` function.
+
+Let's dive into the code for each branch.
 
 ---
 
 ## 5. Detailed Walkthrough 1: The Sliding Window (The Secretary)
 *(Code reference: `SlidingWindowAttention` in `kernel.py`)*
 
-There's no magic here. The code literally just creates an standard Dense Attention matrix, but uses a stronger causal mask.
+The Sliding Window branch is the simplest. It performs standard dense attention, but instead of evaluating the entire timeline, it only allows Keys that are within a `window_size` (e.g., the last 512 tokens).
 
-Instead of just masking out the future:
-`k_idx > t_idx` (Future)
-
-It also masks out the deep past!
-`k_idx < (t_idx - window_size)` (Too old)
+Here is the exact code for how the **Secretary** operates:
 
 ```python
-# Combine masks: True if invalid (future, or too far in past)
-invalid_mask = (k_idx > t_abs) | (k_idx <= t_abs - W)
-logits = logits.masked_fill(invalid_mask, float("-inf"))
-```
+# 1. Compute the interaction scores between Queries and Keys
+# Q shape: [Batch, Time, Heads, Dimension]
+# K_ctx shape: [Batch, Time, Heads, Dimension]
+logits = torch.einsum("bthd,bkhd->bthk", Q_rep.float(), K_ctx.float()) * scale
 
-By adding `-inf` to old memory, the subsequent `Softmax` forces the probability to 0.0%. The math practically ignores anything older than `W`.
+# 2. Create the boundaries (The "Window")
+# We only want to look backwards by W tokens.
+W = self.window_size
+
+# t_abs is the current timestamp. k_idx is the timestamp of the memory.
+# IF k_idx is > t_abs, it's in the future.
+# IF k_idx is <= (t_abs - W), it's too old.
+invalid_mask = (k_idx > t_abs) | (k_idx <= t_abs - W)
+
+# 3. Apply the mask
+# Replace out-of-bounds scores with negative infinity
+logits = logits.masked_fill(invalid_mask, float("-inf"))
+
+# 4. Turn scores into percentages and mix the Values!
+probs = torch.softmax(logits, dim=-1)
+O_window = torch.einsum("bthk,bkhd->bthd", probs.to(V_ctx.dtype), V_ctx)
+```
+*Why?* Grammar and flow are dictated by immediate context. You don't need to read chapter 1 to know how to finish a sentence in chapter 10.
 
 *Note: In production builds, we wouldn't even generate the full grid array just to mask it out. A fast library like `flash_attn` executes this operation dynamically directly on the GPU registers, skipping the memory allocation step completely.*
 
@@ -225,15 +257,18 @@ By adding `-inf` to old memory, the subsequent `Softmax` forces the probability 
 ## 6. Detailed Walkthrough 2: Compressed Attention (The Skimmer)
 *(Code reference: `CompressedKVUpdate` and `CompressedAttention`)*
 
-This is where things get completely wild. How do you compress a matrix on the fly?
+If evaluating 100,000 tokens is too slow, what if we just average them together?
+In NSA, we group Keys and Values into `blocks` (e.g., size 16). We compress those 16 tokens into **1 single token**.
 
-When generating tokens, for every $C$ (Compression Ratio, e.g., 16) raw tokens processed, we want to create exactly **1 compressed token**.
+*   100,000 raw tokens / 16 = 6,250 compressed tokens.
 
-### The Convolution Layer
-In `CompressedKVUpdate`, we use an incredibly standard ML feature called a 1D Convolution (`nn.Conv1d` or an MLP Linear layer equivalent).
+First, we compress the memory using an incredibly standard ML feature called a 1D Convolution (`nn.Conv1d` or an MLP Linear layer equivalent).
 ```python
-# Pool `c` tokens into 1 via simple average or trainable linear projection
-k_c = k_chunk.mean(dim=2) # simplified average pooling
+# K_chunk shape: [Batch, Number_of_Blocks, Block_Size, Heads, Dimension]
+# Using .mean(dim=2) averages out the Block_Size dimension!
+# 16 tokens simply become 1 uniform vector.
+K_c = k_chunk.mean(dim=2)
+V_c = v_chunk.mean(dim=2)
 ```
 
 Visually, compressing a block of length $C=4$ looks like this:
@@ -244,76 +279,75 @@ Average:            \  |  /   /                   \  |  /   /
 Compressed:         [ Block 1 ]                     [ Block 2 ]
 ```
 
-We now have two new matrices: `K_c` (Compressed Keys) and `V_c` (Compressed Values).
-If the original sequences had 16,000 tokens, `K_c` only has 1,000 tokens.
-
-### Dense Attention against the Skimmed Vector
-Inside `CompressedAttention.forward()`, we just run standard Dense Attention!
-But instead of `Scores = Q * K`, we run `Scores = Q * K_c`.
-
-Because `K_c` is tiny, this math executes instantly. Wait, there's a problem...
-
-### Fixing Causal Bleed in Summaries
-If a block contains raw tokens ranging from Time=0 to Time=15, and the current Query is evaluating at Time=8, is it allowed to look at that blurry block?
-
-**No!** That blurry block contains information from Time=9 through 15. Looking at the block allows the model to "see into the future." This is called Data Leakage or Causal Bleed.
-
-If you look closely at the PyTorch code:
+Now, we run the **Skimmer**:
 ```python
-# Compressed token tc covers original tokens up to (tc+1)*c - 1
-# Allow if the tail of the block <= current time t
-causal_mask = ((tc_idx + 1) * c - 1) > t_abs  # True = FUTURE = MASK OUT
-```
-We rigidly enforce the rule: **A compressed block is invisible until ALL of the tokens inside of it belong strictly to the past.**
+# 1. Compute scores against the COMPRESSED keys
+logits = torch.einsum("bthd,bshd->bths", Q_rep.float(), K_c.float()) * scale
 
-### The Danger of NaN Propagation
-During our development, we discovered a lethal bug within this causal logic.
-If you are at the very beginning of a sentence (e.g. evaluating Time=4), the first compressed block covering Time 0-15 is invisible (because 15 > 4). Every single block is masked out to negative infinity!
-When `torch.softmax` evaluates an array consisting entirely of `-inf`, it mathematically panics and returns `NaN` (Not a Number). This `NaN` poisoned the entire network in a chain reaction.
+# 2. Prevent the model from looking into the future
+causal_mask = ((tc_idx + 1) * c - 1) > t_abs
+logits = logits.masked_fill(causal_mask, float("-inf"))
 
-The fix was explicitly scrubbing `NaNs` out of the probability stream before evaluating Values:
-```python
-attn_weights = torch.softmax(logits, dim=-1)
-attn_weights = torch.nan_to_num(attn_weights, nan=0.0) # THE FIX!
-O_compressed = torch.einsum("bths,bshd->bthd", attn_weights, V_c_exp)
+# 3. Generate the ATTENTION WEIGHTS (This is the most important part!)
+# These percentages tell us EXACTLY which compressed blocks the Query liked.
+attn_weights_c = torch.softmax(logits, dim=-1)
+
+# 4. Prevent Causal NaN Propagation
+# If every block is masked out (because we are at token 0), softmax returns NaN.
+# We must scrub NaNs out before proceeding to protect the network.
+attn_weights_c = torch.nan_to_num(attn_weights_c, nan=0.0)
+
+# 5. Mix the compressed values
+O_compressed = torch.einsum("bths,bshd->bthd", attn_weights_c, V_c.float())
 ```
+
+We now have `O_compressed`, which is a fast, blurry answer. But crucially, we also generated `attn_weights_c`.
 
 ---
 
 ## 7. Detailed Walkthrough 3: The Indexer and Selected Attention (The Detective)
 
-The Skimmer (Compressed attention) returned a Matrix of probabilities: `attn_weights`.
-If we have 1,000 compressed blocks, these weights indicate exactly which of those 1,000 blocks the Query cared about the most.
+The Detective cannot read all 100,000 tokens. It needs the Skimmer to tell it where to look. We use an **Indexer** function to sort the `attn_weights_c` percentages and find the "Top N" most relevant blocks.
 
-### The Python Indexer
-`build_block_indices_from_compressed` is essentially just `argsort()`.
+Here is the exact code that bridges the Skimmer and the Detective:
 
 ```python
-# 1. Get the Top-K indices from the compressed weights
-_, top_k_indices = torch.topk(attn_weights_compressed, k=selected_blocks, dim=-1)
+# attn_weights_compressed contains the percentage scores for every block.
+# torch.topk automatically finds the highest values!
+# If selected_blocks=4, we get the IDs of the 4 best blocks.
+_, top_k_indices = torch.topk(attn_weights_c, k=selected_blocks, dim=-1)
 
-# Sort them back into chronological timeline order
-sorted_indices, _ = torch.sort(top_k_indices, dim=-1)
+# We sort the 4 blocks back into chronological order so time flows forward
+block_indices_nsa, _ = torch.sort(top_k_indices, dim=-1)
 ```
 
-If the sentence has ten million blocks, `sorted_indices` will be just an array containing 4 numbers: e.g., `[ 12, 114, 2501, 8812 ]`. These are the numeric IDs of the blocks that triggered the highest mathematical resonance according to the Skimmer.
-
 ### Reconstructing the High-Definition Truth
-Inside `_selected_attention_fallback`, we iterate over those 4 exact blocks.
+Inside `_selected_attention_fallback`, we take `block_indices_nsa` and go back to the original, uncompressed sequence to extract *only* those blocks in High Definition. 
+
+Here is the exact PyTorch code for the **Detective**:
+
 ```python
-for blk_id in blocks:
+# For every block ID the Skimmer found...
+for blk_id in top_blocks:
+    # Calculate exactly where that block starts and ends in the raw memory
     start_time = blk_id * BLOCK_SIZE
     end_time = start_time + BLOCK_SIZE
     
     # Pluck out the original, 100% uncompressed keys and values!
-    k_tokens.append(K[b_idx, start_time:end_time, h_idx, :])
-    v_tokens.append(V[b_idx, start_time:end_time, h_idx, :])
+    k_tokens.append(K_ctx[b_idx, start_time:end_time, h_idx, :])
+    v_tokens.append(V_ctx[b_idx, start_time:end_time, h_idx, :])
+
+# Stitch the specific fragments together into one mini-timeline
+k_cat = torch.cat(k_tokens) 
+v_cat = torch.cat(v_tokens)
+
+# Run standard Dense Attention on just this tiny, perfect High-Def timeline!
+scores = torch.matmul(Q.float(), k_cat.float().transpose()) * scale
+probs = torch.softmax(scores, dim=-1)
+O_selected = torch.matmul(probs, v_cat.float())
 ```
 
-We concatenate those specific fragments of the timeline into `k_cat`.
-We then perform extremely narrow Dense Attention: `Scores = Q * k_cat`.
-
-We avoided mathing billions of numbers, dynamically finding needles in a haystack.
+This is where the magic happens. We searched across 100,000 tokens, found the 4 most important chunks, and read them perfectly without doing out-of-memory math!
 
 ---
 
