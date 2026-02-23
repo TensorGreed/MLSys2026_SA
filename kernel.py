@@ -61,9 +61,29 @@
 # ==================================================================================================
 
 import torch
-import tilelang
-from tilelang import language as T
-import tilelang.testing
+try:
+    import tilelang
+    from tilelang import language as T
+    import tilelang.testing
+    TILELANG_AVAILABLE = True
+except ImportError:
+    TILELANG_AVAILABLE = False
+    
+    # Dummy mock objects so the code parses when tilelang is unavailable
+    class TileLangMock:
+        def __getattr__(self, name):
+            return TileLangMock()
+        def __call__(self, *args, **kwargs):
+            return lambda f=None: f if f is not None else TileLangMock()
+        def __enter__(self):
+            return (0, 0, 0)
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+    
+    tilelang = TileLangMock()
+    T = TileLangMock()
+
+
 import matplotlib.pyplot as plt
 import torch.nn as nn
 import torch.nn.functional as F
@@ -104,6 +124,9 @@ def dense_attention_output(Qrep, K, V, is_causal=True, scale=None):
       turn those similarity scores into probabilities, then mix values
       using those probabilities.
 
+    In Native Sparse Attention (and GQA in general), the model has many more Query heads than Key/Value heads. For example, if you have 32 query heads but only 8 KV heads, each KV head is shared by a group of 4 query heads.
+    Qrep is the query tensor "down-sampled" to match the number of KV heads so that a simple reference attention calculation can be performed for validation.
+
     Shapes:
       Qrep: [B, T, H, D]
       K:    [B, T, H, D]
@@ -130,6 +153,16 @@ def dense_attention_output(Qrep, K, V, is_causal=True, scale=None):
         scale = 1.0 / (D ** 0.5)
 
     # logits[b,t,h,k] = dot(Qrep[b,t,h,:], K[b,k,h,:])
+    # einsum is a way to do matrix multiplication of Qrep and K
+    # "bthd,bkhd->bthk" means:
+    #   - b: batch
+    #   - t: query time
+    #   - h: query head
+    #   - d: query dimension
+    #   - k: key time
+    #   - d: key dimension
+    #   - ->: output
+    #   - bthk: output batch, query time, query head, key time
     logits = torch.einsum("bthd,bkhd->bthk", Qrep.float(), K.float()) * scale
 
     # Causal mask: disallow attending to future tokens (k > t)
@@ -377,6 +410,7 @@ class CompressedAttention(nn.Module):
         # (5) Softmax and weighted sum
         # -----------------------------------------------------------------------
         attn_weights = torch.softmax(logits, dim=-1)  # [B, T, HQ, T_c]
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         O_compressed = torch.einsum("bths,bshd->bthd", attn_weights, V_c_exp.float())
 
         return O_compressed, attn_weights, K_c, V_c  # return attn_weights for indexer use
@@ -833,6 +867,8 @@ class NativeSparseAttention(nn.Module):
         # -----------------------------------------------------------------------------
         # We process each segment independently so no attention leaks across sequence
         # boundaries. This is simple, explicit, and easy for beginners to inspect.
+
+        # cu_seqlens stands for Cumulative Sequence Lengths. It is a standard way (used by libraries like FlashAttention) to tell the kernel where one sequence ends and the next begins within a packed tensor. If this variable is provided, the model knows it isn't looking at one giant sequence, but rather a "bus" full of several smaller sequences.
         if cu_seqlens is not None:
             if kernel_fn is not None:
                 warnings.warn(
@@ -843,8 +879,26 @@ class NativeSparseAttention(nn.Module):
             if Q.shape[0] != 1 or K.shape[0] != 1 or V.shape[0] != 1:
                 raise ValueError("varlen mode expects batch size 1 with packed tokens.")
 
+            # offsets is a list of integers that tells the model where each sequence begins and ends within the packed tensor.
             offsets = cu_seqlens.to("cpu").tolist()
+            # offsets = [0, 10, 25, 30] means:
+            # - Sequence 1: tokens 0..9 (length 10)
+            # - Sequence 2: tokens 10..24 (length 15)
+            # - Sequence 3: tokens 25..29 (length 5)
             segments = [(int(offsets[i]), int(offsets[i + 1])) for i in range(len(offsets) - 1)]
+
+            # -----------------------------------------------------------------------
+            # 1) Run the full NSA pipeline and return output plus diagnostics.
+            # -----------------------------------------------------------------------
+            # out_chunks: list of output chunks for each segment
+            # cmp_chunks: list of compressed branch output chunks for each segment
+            # slc_chunks: list of selected branch output chunks for each segment
+            # swa_chunks: list of window branch output chunks for each segment
+            # gcmp_chunks: list of compressed branch gate chunks for each segment
+            # gslc_chunks: list of selected branch gate chunks for each segment
+            # gswa_chunks: list of window branch gate chunks for each segment
+            # idx_chunks: list of block indices for each segment
+            # cnt_chunks: list of block counts for each segment
 
             out_chunks = []
             cmp_chunks = []
@@ -1011,8 +1065,6 @@ class NativeSparseAttention(nn.Module):
         g_all = torch.sigmoid(g_logits)
         g_cmp = g_all[..., 0]
         g_slc = g_all[..., 1]
-        g_swa = g_all[..., 2]
-
         O_final = (
             g_cmp.unsqueeze(-1) * O_compressed.float()
             + g_slc.unsqueeze(-1) * O_selected.float()
@@ -1135,6 +1187,7 @@ class NativeSparseAttention(nn.Module):
 
                     # Softmax and weighted sum
                     probs = torch.softmax(scores, dim=-1)
+                    probs = torch.nan_to_num(probs, nan=0.0)
                     out_t = torch.matmul(probs, v_cat.float())  # [G, D]
                     O[b_idx, t, q_heads_range, :] = out_t
 
@@ -1638,18 +1691,22 @@ def main():
     # Compile TileLang kernel (happens once per configuration)
     # ==================================================================
     print("\n--- Compiling TileLang sparse attention kernel ---")
-    kernel = native_sparse_attention(
-        batch=B,
-        heads=HQ,
-        seq_len=SEQ_LEN,
-        dim=D,
-        is_causal=True,
-        block_size=block_size,
-        groups=groups,
-        selected_blocks=S,
-        scale=scale,
-    )
-    print("Kernel compiled successfully.")
+    if TILELANG_AVAILABLE:
+        kernel = native_sparse_attention(
+            batch=B,
+            heads=HQ,
+            seq_len=SEQ_LEN,
+            dim=D,
+            is_causal=True,
+            block_size=block_size,
+            groups=groups,
+            selected_blocks=S,
+            scale=scale,
+        )
+        print("Kernel compiled successfully.")
+    else:
+        print("TileLang not available. Skipping compilation.")
+        kernel = None
 
     # ==================================================================
     # Create random inputs
@@ -1691,10 +1748,17 @@ def main():
 
     print(f"NSA module parameters: {sum(p.numel() for p in nsa.parameters()):,}")
 
-    # Run the full NSA pipeline
-    # We pass the compiled TileLang kernel for the selected branch
-    with torch.no_grad():
-        result = nsa(Q, K, V, kernel_fn=kernel, is_causal=True, scale=scale)
+    # Run the full NSA pipeline with PyTorch Profiler
+    from torch.profiler import profile, record_function, ProfilerActivity
+    print("Starting NSA forward pass with PyTorch profiler...")
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+        with record_function("NSA_Forward"):
+            with torch.no_grad():
+                result = nsa(Q, K, V, kernel_fn=kernel, is_causal=True, scale=scale)
+                
+    # Save Chrome Trace
+    prof.export_chrome_trace("nsa_trace.json")
+    print(f"Profiler trace saved to 'nsa_trace.json'. Open in chrome://tracing")
 
     # Extract outputs
     O_nsa       = result["output"]
@@ -1774,19 +1838,25 @@ def main():
         _ = kernel(Q, K, V, block_indices_nsa, block_counts_nsa)
     torch.cuda.synchronize()
 
-    # Timed run
+    # Timed run with NVTX markers
     iters = 200
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
 
+    # Note: torch.cuda.nvtx markers allow NVIDIA Nsight Systems (nsys) to see the range
+    torch.cuda.nvtx.range_push("TileLang_Sparse_Kernel_Loop")
     start_evt.record()
     for _ in range(iters):
-        _ = kernel(Q, K, V, block_indices_nsa, block_counts_nsa)
+        if kernel is not None:
+            _ = kernel(Q, K, V, block_indices_nsa, block_counts_nsa)
+        else:
+            _ = nsa._selected_attention_fallback(Q, K, V, block_indices_nsa, block_counts_nsa, groups, True, scale)
     end_evt.record()
+    torch.cuda.nvtx.range_pop()
 
     torch.cuda.synchronize()
     ms = start_evt.elapsed_time(end_evt)
-    print(f"  TileLang kernel: {ms/iters:.4f} ms/iter (avg over {iters} iters)")
+    print(f"  Sparse Focus Sub-Kernel: {ms/iters:.4f} ms/iter (avg over {iters} iters)")
 
     # ==================================================================
     # Heatmap visualization

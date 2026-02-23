@@ -216,7 +216,7 @@ class NSATransformerBlock(nn.Module):
 
         # Reshape from multi-head back to hidden_dim
         B, T, HQ, D = attn_output.shape
-        attn_output = attn_output.reshape(B, T, HQ * D)
+        attn_output = attn_output.contiguous().reshape(B, T, HQ * D)
 
         # Output projection + residual
         x = residual + self.dropout(self.qkv_proj.wo(attn_output.float()))
@@ -369,8 +369,8 @@ class NSALanguageModel(nn.Module):
             # Crop to max sequence length
             context = generated[:, -self.config.seq_len:]
 
-            # Forward pass
-            logits, _ = self.forward(context, kernel_fn=kernel_fn)
+            # Forward pass (force fallback kernel because generation sequence length changes)
+            logits, _ = self.forward(context, kernel_fn=None)
 
             # Get logits for the LAST position only
             logits = logits[:, -1, :] / temperature  # [1, vocab_size]
